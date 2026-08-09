@@ -1,0 +1,30 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Data =====
+# Raw MRI data is too large for GitHub (~24.7 GB)
+# Download from: https://www.oasis-brains.org/#data
+data/raw/OAS2_RAW_PART1/
+
+# ===== Outputs & Models (not pushed for now) =====
+outputs/
+models/
+
+# ===== OS / IDE =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ===== Temp =====
+check_sizes.ps1
