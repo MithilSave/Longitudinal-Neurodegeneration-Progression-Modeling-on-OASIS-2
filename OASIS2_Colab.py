@@ -2410,7 +2410,10 @@ def compute_w_scores(
 
     from sklearn.linear_model import LinearRegression
 
-    w_df = regional_volumes[["subject_id", "session_id"]].copy()
+    cols_to_copy = ["subject_id"]
+    if "session_id" in regional_volumes.columns:
+        cols_to_copy.append("session_id")
+    w_df = regional_volumes[cols_to_copy].copy()
     age_values = merged["Age"].values.reshape(-1, 1)
 
     for col in region_cols:
@@ -2511,9 +2514,12 @@ def fit_all_betas(
         demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
 
     if time_col in demo_df.columns:
+        join_cols = ["subject_id"]
+        if "session_id" in w_scores.columns and "session_id" in demo_df.columns:
+            join_cols.append("session_id")
         merged = w_scores.merge(
-            demo_df[["subject_id", "session_id", time_col]],
-            on=["subject_id", "session_id"], how="left",
+            demo_df[join_cols + [time_col]],
+            on=join_cols, how="left",
         )
     else:
         # Fall back: assume sessions are ordered chronologically
@@ -2612,9 +2618,12 @@ def validate_ndm(
         demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
 
     if time_col in demo_df.columns:
+        join_cols = ["subject_id"]
+        if "session_id" in w_scores.columns and "session_id" in demo_df.columns:
+            join_cols.append("session_id")
         merged = w_scores.merge(
-            demo_df[["subject_id", "session_id", time_col]],
-            on=["subject_id", "session_id"], how="left",
+            demo_df[join_cols + [time_col]],
+            on=join_cols, how="left",
         )
     else:
         merged = w_scores.copy()
@@ -3192,7 +3201,7 @@ else:
     except Exception as e:
         print(f'[ERROR] Kaggle download failed: {type(e).__name__}: {e}')
         print('        Double-check your kaggle.json credentials (previous cell) and that')
-        print(f'        you have accepted the dataset terms at:')
+        print('        you have accepted the dataset terms at:')
         print(f'        https://www.kaggle.com/datasets/{KAGGLE_DATASET}')
 
 # Always show what actually landed on Drive, so failures are obvious immediately.
@@ -3391,7 +3400,7 @@ if not deficit_df.empty:
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
     mean_d = deficit_df.mean().sort_values(ascending=False)
     axes[0].bar(range(len(mean_d)), mean_d.values,
-                color=plt.cm.RdYlGn_r(np.linspace(0.1, 0.9, len(mean_d))))
+                color=plt.get_cmap('RdYlGn_r')(np.linspace(0.1, 0.9, len(mean_d))))
     axes[0].set_xticks(range(len(mean_d)))
     axes[0].set_xticklabels(mean_d.index, rotation=45, ha='right', fontsize=9)
     axes[0].set_ylabel('Mean deficit'); axes[0].set_title('Population-avg Deficit Profiles')
