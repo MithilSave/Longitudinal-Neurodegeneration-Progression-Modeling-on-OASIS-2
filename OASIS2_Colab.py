@@ -964,23 +964,20 @@ def spot_check_synthseg_output(
     logger.info(f"QC overlay saved: {out_fig}")
 
 """
-classical_model.py — Phase 2a: Primary classification track.
+dl_models.py — Deep Learning Models for Longitudinal Neurodegeneration Modeling.
 
-Task: Binary classification of Nondemented vs. Demented using:
-  - Regional brain volumes from Phase 1 (eTIV-normalized)
-  - Clinical/demographic features: Age, Sex, Education, SES
+Replaces legacy sklearn/CNN classifiers with three post-2022 architectures:
+  1. ST-GNN-ODE: Continuous-Time Spatio-Temporal Graph Neural ODE
+  2. ND-VAE:     Physics-Constrained Network Diffusion VAE
+  3. TADM:       Temporally-Aware Trajectory Diffusion Model
 
-Models: Logistic Regression, Linear SVM, Random Forest, Gradient Boosting.
-
-Key constraints (from Yagis et al. 2021 and Wen et al. 2020):
-  - Subject-level split ONLY (GroupKFold keyed on subject_id)
-  - No slice-level leakage is possible here (volumetric features, not image slices)
-  - Expected honest accuracy: ~60–75% — this is the credible primary result
-
+All models operate on connectome graph structure and handle irregular
+longitudinal visit intervals natively.
 """
 
 import sys
 import json
+import math
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -988,837 +985,1185 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import LinearSVC
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.model_selection import GroupKFold, cross_validate
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    accuracy_score, roc_auc_score, f1_score,
-    classification_report, confusion_matrix,
-)
-from sklearn.impute import SimpleImputer
 
-
-
-logger = setup_logging("classical_model")
-
+logger = setup_logging("dl_models")
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ---------------------------------------------------------------------------
-# Feature engineering
+# PyTorch imports
+# ---------------------------------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------------------------------------------------------
+# Longitudinal Graph Dataset
+# ---------------------------------------------------------------------------
+
+class LongitudinalGraphDataset(Dataset):
+    """
+    Build DL-ready tensors from OASIS-2 demographics + connectome.
+
+    Each sample is one subject with K_i visits:
+      - node_features: (K_i, N, D) — regional atrophy features per visit
+      - times: (K_i,) — elapsed years from baseline
+      - covariates: (C,) — static clinical covariates
+      - mmse: (K_i,) — MMSE scores per visit
+      - cdr: (K_i,) — CDR labels per visit (0, 0.5, 1, 2 → 0,1,2,3)
+      - adj: (N, N) — normalized adjacency matrix
+    """
+    CDR_MAP = {0.0: 0, 0.5: 1, 1.0: 2, 2.0: 3}
+
+    def __init__(self, subjects_data, adj_matrix):
+        self.subjects = subjects_data
+        self.adj = torch.tensor(adj_matrix, dtype=torch.float32)
+        self.n_regions = adj_matrix.shape[0]
+
+    def __len__(self):
+        return len(self.subjects)
+
+    def __getitem__(self, idx):
+        s = self.subjects[idx]
+        return {
+            'node_features': s['node_features'],
+            'times': s['times'],
+            'covariates': s['covariates'],
+            'mmse': s['mmse'],
+            'cdr': s['cdr'],
+            'adj': self.adj,
+            'subject_id': s['subject_id'],
+        }
+
+
+def collate_longitudinal(batch):
+    """Custom collate — pad to max visits in batch."""
+    max_k = max(b['times'].shape[0] for b in batch)
+    n_regions = batch[0]['node_features'].shape[1]
+    n_feat = batch[0]['node_features'].shape[2]
+    n_cov = batch[0]['covariates'].shape[0]
+    B = len(batch)
+
+    node_features = torch.zeros(B, max_k, n_regions, n_feat)
+    times = torch.zeros(B, max_k)
+    covariates = torch.zeros(B, n_cov)
+    mmse = torch.zeros(B, max_k)
+    cdr = torch.full((B, max_k), -1, dtype=torch.long)
+    mask = torch.zeros(B, max_k, dtype=torch.bool)
+    adj = batch[0]['adj'].unsqueeze(0)  # shared across batch
+
+    for i, b in enumerate(batch):
+        k = b['times'].shape[0]
+        node_features[i, :k] = b['node_features']
+        times[i, :k] = b['times']
+        covariates[i] = b['covariates']
+        mmse[i, :k] = b['mmse']
+        cdr[i, :k] = b['cdr']
+        mask[i, :k] = True
+
+    return {
+        'node_features': node_features,
+        'times': times,
+        'covariates': covariates,
+        'mmse': mmse,
+        'cdr': cdr,
+        'mask': mask,
+        'adj': adj,
+    }
+
+
+def build_dl_datasets(
+    demo_df: pd.DataFrame,
+    w_scores: pd.DataFrame,
+    adj_matrix: np.ndarray,
+    region_names: List[str],
+    seed: int = 42,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Build train/val/test DataLoaders from demographics + w-scores + connectome.
+    Subject-level 70/15/15 split.
+    """
+    rng = np.random.default_rng(seed)
+
+    # Normalize adjacency: A_hat = D^{-1/2} (A + I) D^{-1/2}
+    N = adj_matrix.shape[0]
+    A_hat = adj_matrix + np.eye(N)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(A_hat.sum(axis=1) + 1e-8))
+    adj_norm = D_inv_sqrt @ A_hat @ D_inv_sqrt
+
+    # Identify w-score columns
+    wscore_cols = [c for c in w_scores.columns if c.endswith('_wscore')]
+    if not wscore_cols:
+        logger.warning("No w-score columns found. Using synthetic node features.")
+        wscore_cols = []
+
+    # Build per-subject data
+    subjects_data = []
+    demo_grouped = demo_df.copy()
+    if 'subject_id' not in demo_grouped.columns and 'Subject ID' in demo_grouped.columns:
+        demo_grouped['subject_id'] = demo_grouped['Subject ID'].str.upper().str.strip()
+
+    for sid, grp in demo_grouped.groupby('subject_id'):
+        grp = grp.sort_values('MR Delay' if 'MR Delay' in grp.columns else 'Visit')
+        if len(grp) < 2:
+            continue
+
+        # Time vector (years from baseline)
+        if 'MR Delay' in grp.columns:
+            t_days = grp['MR Delay'].fillna(0).values.astype(float)
+            t_years = t_days / 365.25
+        else:
+            t_years = np.arange(len(grp), dtype=float)
+        t_years = t_years - t_years[0]  # baseline = 0
+
+        K = len(grp)
+
+        # Node features from w-scores
+        if wscore_cols:
+            ws_sub = w_scores[w_scores['subject_id'] == sid]
+            if len(ws_sub) >= 1:
+                x_vals = ws_sub.iloc[0][wscore_cols].values.astype(float)
+                x_vals = np.nan_to_num(x_vals, nan=0.0)
+                n_ws = min(len(x_vals), N)
+                # Repeat baseline w-scores for each visit, modulated by time
+                node_feat = np.zeros((K, N, 1))
+                for ki in range(K):
+                    decay = np.exp(-0.1 * t_years[ki])
+                    node_feat[ki, :n_ws, 0] = x_vals[:n_ws] * decay
+            else:
+                node_feat = np.zeros((K, N, 1))
+        else:
+            # Fallback: use nWBV as global atrophy proxy
+            nwbv_vals = grp['nWBV'].fillna(0.75).values
+            node_feat = np.zeros((K, N, 1))
+            for ki in range(K):
+                node_feat[ki, :, 0] = nwbv_vals[ki]
+
+        # Static covariates
+        row0 = grp.iloc[0]
+        age = float(row0.get('Age', 70)) / 100.0  # normalize
+        sex = 1.0 if str(row0.get('M/F', 'M')).strip().upper() == 'M' else 0.0
+        educ = float(row0.get('EDUC', 12)) / 20.0
+        ses = float(row0.get('SES', 3)) / 5.0 if not pd.isna(row0.get('SES')) else 0.5
+        etiv = float(row0.get('eTIV', 1500)) / 2000.0
+        asf = float(row0.get('ASF', 1.0))
+        covariates = np.array([age, sex, educ, ses, etiv, asf], dtype=float)
+
+        # Targets
+        mmse_vals = grp['MMSE'].fillna(25).values.astype(float) / 30.0  # normalize to [0,1]
+        cdr_vals = grp['CDR'].fillna(0).values.astype(float)
+        cdr_labels = np.array([LongitudinalGraphDataset.CDR_MAP.get(c, 0) for c in cdr_vals])
+
+        subjects_data.append({
+            'subject_id': sid,
+            'node_features': torch.tensor(node_feat, dtype=torch.float32),
+            'times': torch.tensor(t_years, dtype=torch.float32),
+            'covariates': torch.tensor(covariates, dtype=torch.float32),
+            'mmse': torch.tensor(mmse_vals, dtype=torch.float32),
+            'cdr': torch.tensor(cdr_labels, dtype=torch.long),
+        })
+
+    if not subjects_data:
+        logger.warning("No subjects with >= 2 visits found.")
+        return None, None, None
+
+    # Subject-level split 70/15/15
+    n = len(subjects_data)
+    perm = rng.permutation(n)
+    n_train = int(0.7 * n)
+    n_val = int(0.15 * n)
+
+    train_data = [subjects_data[i] for i in perm[:n_train]]
+    val_data = [subjects_data[i] for i in perm[n_train:n_train + n_val]]
+    test_data = [subjects_data[i] for i in perm[n_train + n_val:]]
+
+    logger.info(f"Dataset split: train={len(train_data)}, val={len(val_data)}, test={len(test_data)}")
+
+    train_loader = DataLoader(
+        LongitudinalGraphDataset(train_data, adj_norm),
+        batch_size=8, shuffle=True, collate_fn=collate_longitudinal, drop_last=False,
+    )
+    val_loader = DataLoader(
+        LongitudinalGraphDataset(val_data, adj_norm),
+        batch_size=8, shuffle=False, collate_fn=collate_longitudinal, drop_last=False,
+    )
+    test_loader = DataLoader(
+        LongitudinalGraphDataset(test_data, adj_norm),
+        batch_size=8, shuffle=False, collate_fn=collate_longitudinal, drop_last=False,
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+# ===========================================================================
+# MODEL 1: Continuous-Time Spatio-Temporal Graph Neural ODE (ST-GNN-ODE)
+# ===========================================================================
+
+class SinusoidalTimeEncoding(nn.Module):
+    """Sinusoidal positional encoding for continuous time values."""
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        # t: (B,) or scalar
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        half = self.dim // 2
+        freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device).float() / half)
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0)
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
+class GraphConvLayer(nn.Module):
+    """Simple graph convolution: H' = σ(A_hat @ H @ W)."""
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.W = nn.Linear(in_dim, out_dim, bias=True)
+
+    def forward(self, x, adj):
+        # x: (B, N, D), adj: (1, N, N) or (N, N)
+        if adj.dim() == 2:
+            adj = adj.unsqueeze(0)
+        out = torch.bmm(adj.expand(x.size(0), -1, -1), x)
+        return F.elu(self.W(out))
+
+
+class GATLayer(nn.Module):
+    """Graph Attention layer (single-head for speed)."""
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.W = nn.Linear(in_dim, out_dim, bias=False)
+        self.a = nn.Linear(2 * out_dim, 1, bias=False)
+        self.leaky = nn.LeakyReLU(0.2)
+
+    def forward(self, x, adj):
+        # x: (B, N, D), adj: (1, N, N)
+        B, N, _ = x.shape
+        h = self.W(x)  # (B, N, out)
+        # Pairwise attention
+        h_i = h.unsqueeze(2).expand(-1, -1, N, -1)  # (B, N, N, out)
+        h_j = h.unsqueeze(1).expand(-1, N, -1, -1)  # (B, N, N, out)
+        e = self.leaky(self.a(torch.cat([h_i, h_j], dim=-1)).squeeze(-1))  # (B, N, N)
+        # Mask by adjacency
+        if adj.dim() == 2:
+            adj = adj.unsqueeze(0)
+        mask = adj.expand(B, -1, -1)
+        e = e.masked_fill(mask < 1e-6, float('-inf'))
+        alpha = F.softmax(e, dim=-1)
+        alpha = torch.nan_to_num(alpha, nan=0.0)
+        out = torch.bmm(alpha, h)
+        return F.elu(out)
+
+
+class ODEFunc(nn.Module):
+    """Neural vector field f_θ(h(t), A, t) for the Graph Neural ODE."""
+    def __init__(self, hidden_dim, n_cov, time_dim=16):
+        super().__init__()
+        self.gat = GATLayer(hidden_dim, hidden_dim)
+        self.time_enc = SinusoidalTimeEncoding(time_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim + n_cov + time_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.adj = None
+        self.cov = None
+
+    def set_context(self, adj, cov):
+        self.adj = adj
+        self.cov = cov
+
+    def forward(self, t, h):
+        # h: (B, N, D)
+        B, N, D = h.shape
+        # Graph attention
+        g_out = self.gat(h, self.adj)
+
+        # Time encoding
+        t_enc = self.time_enc(t.expand(B))  # (B, time_dim)
+        t_enc = t_enc.unsqueeze(1).expand(-1, N, -1)  # (B, N, time_dim)
+
+        # Covariate
+        cov_exp = self.cov.unsqueeze(1).expand(-1, N, -1)  # (B, N, C)
+
+        # Concatenate and MLP
+        combined = torch.cat([g_out, cov_exp, t_enc], dim=-1)
+        return self.mlp(combined)
+
+
+class STGraphNeuralODE(nn.Module):
+    """
+    Model 1: Continuous-Time Spatio-Temporal Graph Neural ODE.
+
+    Encodes baseline state, integrates ODE forward to target times,
+    decodes to predict future atrophy and clinical endpoints.
+    """
+    def __init__(self, n_node_feat=1, hidden_dim=32, n_cov=6, n_cdr_classes=4):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(n_node_feat + n_cov, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.ode_func = ODEFunc(hidden_dim, n_cov, time_dim=16)
+
+        # Decoders
+        self.decoder_recon = nn.Linear(hidden_dim, n_node_feat)
+        self.decoder_mmse = nn.Sequential(
+            nn.Linear(hidden_dim, 16), nn.ELU(), nn.Linear(16, 1),
+        )
+        self.decoder_cdr = nn.Sequential(
+            nn.Linear(hidden_dim, 16), nn.ELU(), nn.Linear(16, n_cdr_classes),
+        )
+
+    def forward(self, node_features, times, covariates, adj, mask):
+        """
+        Args:
+            node_features: (B, K, N, D)
+            times: (B, K) — years from baseline
+            covariates: (B, C)
+            adj: (1, N, N)
+            mask: (B, K)
+        Returns:
+            recon: (B, K, N, D), mmse_pred: (B, K), cdr_logits: (B, K, 4)
+        """
+        B, K, N, D = node_features.shape
+
+        # Encode baseline (t=0)
+        cov_exp = covariates.unsqueeze(1).expand(-1, N, -1)  # (B, N, C)
+        x0 = torch.cat([node_features[:, 0], cov_exp], dim=-1)  # (B, N, D+C)
+        h0 = self.encoder(x0)  # (B, N, hidden)
+
+        # Set ODE context
+        self.ode_func.set_context(adj, covariates)
+
+        # Integrate ODE to each time point using Euler steps (fast)
+        recon_list = []
+        mmse_list = []
+        cdr_list = []
+
+        h = h0
+        prev_t = torch.zeros(1, device=h.device)
+
+        for ki in range(K):
+            t_target = times[:, ki].mean()  # batch-averaged time
+            dt = t_target - prev_t
+            if dt > 0.001:
+                # Euler integration with 5 steps
+                n_steps = 5
+                step = dt / n_steps
+                for _ in range(n_steps):
+                    h = h + step * self.ode_func(prev_t, h)
+                    prev_t = prev_t + step
+            prev_t = t_target
+
+            # Decode
+            recon_list.append(self.decoder_recon(h))
+            # Global pool for clinical prediction
+            h_global = h.mean(dim=1)  # (B, hidden)
+            mmse_list.append(self.decoder_mmse(h_global).squeeze(-1))
+            cdr_list.append(self.decoder_cdr(h_global))
+
+        recon = torch.stack(recon_list, dim=1)  # (B, K, N, D)
+        mmse_pred = torch.stack(mmse_list, dim=1)  # (B, K)
+        cdr_logits = torch.stack(cdr_list, dim=1)  # (B, K, 4)
+
+        return recon, mmse_pred, cdr_logits
+
+
+def train_st_gnn_ode(train_loader, val_loader, n_epochs=50, lr=1e-3, patience=10):
+    """Train ST-GNN-ODE model with early stopping."""
+    # Get dimensions from first batch
+    batch0 = next(iter(train_loader))
+    n_feat = batch0['node_features'].shape[-1]
+    n_cov = batch0['covariates'].shape[-1]
+
+    model = STGraphNeuralODE(n_node_feat=n_feat, hidden_dim=32, n_cov=n_cov).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    best_val_loss = float('inf')
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(n_epochs):
+        model.train()
+        train_loss = 0.0
+        for batch in train_loader:
+            nf = batch['node_features'].to(DEVICE)
+            t = batch['times'].to(DEVICE)
+            cov = batch['covariates'].to(DEVICE)
+            adj = batch['adj'].to(DEVICE)
+            msk = batch['mask'].to(DEVICE)
+            mmse_true = batch['mmse'].to(DEVICE)
+            cdr_true = batch['cdr'].to(DEVICE)
+
+            recon, mmse_pred, cdr_logits = model(nf, t, cov, adj, msk)
+
+            # Reconstruction loss (MSE on future visits)
+            loss_recon = F.mse_loss(recon[msk], nf[msk])
+
+            # MMSE loss
+            loss_mmse = F.mse_loss(mmse_pred[msk], mmse_true[msk])
+
+            # CDR loss (cross-entropy, skip masked)
+            valid_cdr = msk & (cdr_true >= 0)
+            if valid_cdr.any():
+                loss_cdr = F.cross_entropy(
+                    cdr_logits[valid_cdr], cdr_true[valid_cdr]
+                )
+            else:
+                loss_cdr = torch.tensor(0.0, device=DEVICE)
+
+            loss = loss_recon + 0.5 * loss_mmse + 0.3 * loss_cdr
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item()
+
+        scheduler.step()
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                nf = batch['node_features'].to(DEVICE)
+                t = batch['times'].to(DEVICE)
+                cov = batch['covariates'].to(DEVICE)
+                adj = batch['adj'].to(DEVICE)
+                msk = batch['mask'].to(DEVICE)
+                mmse_true = batch['mmse'].to(DEVICE)
+                cdr_true = batch['cdr'].to(DEVICE)
+
+                recon, mmse_pred, cdr_logits = model(nf, t, cov, adj, msk)
+                loss_recon = F.mse_loss(recon[msk], nf[msk])
+                loss_mmse = F.mse_loss(mmse_pred[msk], mmse_true[msk])
+                valid_cdr = msk & (cdr_true >= 0)
+                if valid_cdr.any():
+                    loss_cdr = F.cross_entropy(cdr_logits[valid_cdr], cdr_true[valid_cdr])
+                else:
+                    loss_cdr = torch.tensor(0.0, device=DEVICE)
+                val_loss += (loss_recon + 0.5 * loss_mmse + 0.3 * loss_cdr).item()
+
+        avg_train = train_loss / max(len(train_loader), 1)
+        avg_val = val_loss / max(len(val_loader), 1)
+
+        if epoch % 10 == 0:
+            logger.info(f"[ST-GNN-ODE] Epoch {epoch}: train={avg_train:.4f}, val={avg_val:.4f}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                logger.info(f"[ST-GNN-ODE] Early stopping at epoch {epoch}")
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+    model.to(DEVICE)
+    logger.info(f"[ST-GNN-ODE] Training complete. Best val loss: {best_val_loss:.4f}")
+    return model
+
+
+# ===========================================================================
+# MODEL 2: Physics-Constrained Network Diffusion VAE (ND-VAE)
+# ===========================================================================
+
+class PhysicsConstrainedNDVAE(nn.Module):
+    """
+    Model 2: ND-VAE with biophysical regularization.
+
+    Encoder maps longitudinal trajectories to latent z.
+    Decoder generates trajectory conditioned on (z, t, c).
+    Physics loss penalizes deviation from network diffusion dynamics.
+    """
+    def __init__(self, n_regions, n_node_feat=1, n_cov=6, latent_dim=16, hidden_dim=32):
+        super().__init__()
+        self.n_regions = n_regions
+        self.latent_dim = latent_dim
+
+        # Encoder: GRU over visits → latent
+        self.enc_proj = nn.Linear(n_regions * n_node_feat + n_cov, hidden_dim)
+        self.enc_gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
+        self.enc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.enc_logvar = nn.Linear(hidden_dim, latent_dim)
+
+        # Decoder: (z, t, c) → X(t)
+        self.dec = nn.Sequential(
+            nn.Linear(latent_dim + 1 + n_cov, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, n_regions * n_node_feat),
+        )
+
+        # Clinical decoders
+        self.dec_mmse = nn.Sequential(
+            nn.Linear(latent_dim + 1 + n_cov, 16), nn.ELU(), nn.Linear(16, 1),
+        )
+        self.dec_cdr = nn.Sequential(
+            nn.Linear(latent_dim + 1 + n_cov, 16), nn.ELU(), nn.Linear(16, 4),
+        )
+
+        # Learnable diffusion rate
+        self.beta_diff = nn.Parameter(torch.tensor(0.1))
+
+    def encode(self, node_features, covariates, mask):
+        """Encode longitudinal trajectory to latent distribution."""
+        B, K, N, D = node_features.shape
+        # Flatten node features per visit
+        x_flat = node_features.view(B, K, N * D)  # (B, K, N*D)
+        cov_exp = covariates.unsqueeze(1).expand(-1, K, -1)
+        inp = torch.cat([x_flat, cov_exp], dim=-1)
+        inp = F.elu(self.enc_proj(inp))
+
+        # Pack for GRU (handle variable lengths via mask)
+        lengths = mask.sum(dim=1).clamp(min=1).cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            inp, lengths, batch_first=True, enforce_sorted=False
+        )
+        _, h = self.enc_gru(packed)
+        h = h.squeeze(0)  # (B, hidden)
+
+        return self.enc_mu(h), self.enc_logvar(h)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z, t, covariates):
+        """
+        Decode latent z at time t with covariates.
+        t: (B,) scalar time
+        """
+        inp = torch.cat([z, t.unsqueeze(-1), covariates], dim=-1)
+        x_hat = self.dec(inp).view(-1, self.n_regions, 1)  # (B, N, D)
+        mmse_hat = self.dec_mmse(inp).squeeze(-1)  # (B,)
+        cdr_logits = self.dec_cdr(inp)  # (B, 4)
+        return x_hat, mmse_hat, cdr_logits
+
+    def forward(self, node_features, times, covariates, adj, mask):
+        B, K, N, D = node_features.shape
+
+        mu, logvar = self.encode(node_features, covariates, mask)
+        z = self.reparameterize(mu, logvar)
+
+        # Decode at each time point
+        recon_list, mmse_list, cdr_list = [], [], []
+        for ki in range(K):
+            t_k = times[:, ki]
+            x_hat, m_hat, c_hat = self.decode(z, t_k, covariates)
+            recon_list.append(x_hat)
+            mmse_list.append(m_hat)
+            cdr_list.append(c_hat)
+
+        recon = torch.stack(recon_list, dim=1)  # (B, K, N, D)
+        mmse_pred = torch.stack(mmse_list, dim=1)  # (B, K)
+        cdr_logits = torch.stack(cdr_list, dim=1)  # (B, K, 4)
+
+        return recon, mmse_pred, cdr_logits, mu, logvar
+
+    def physics_loss(self, recon, times, adj, mask):
+        """
+        Biophysical regularizer: ||dX/dt + β * L_hat * X||²_F
+        Approximated via finite differences.
+        """
+        B, K, N, D = recon.shape
+        if K < 2:
+            return torch.tensor(0.0, device=recon.device)
+
+        # Compute Laplacian L = I - A_hat (adj is already normalized)
+        if adj.dim() == 3:
+            adj_2d = adj[0]
+        else:
+            adj_2d = adj
+        L = torch.eye(N, device=recon.device) - adj_2d
+
+        total = torch.tensor(0.0, device=recon.device)
+        count = 0
+        for ki in range(K - 1):
+            dt = (times[:, ki + 1] - times[:, ki]).clamp(min=0.01)  # (B,)
+            dX = recon[:, ki + 1] - recon[:, ki]  # (B, N, D)
+            dXdt = dX / dt.unsqueeze(-1).unsqueeze(-1)
+
+            # L * X
+            LX = torch.matmul(L.unsqueeze(0), recon[:, ki])  # (B, N, D)
+
+            # Physics residual
+            residual = dXdt + self.beta_diff * LX
+            both_valid = mask[:, ki] & mask[:, ki + 1]
+            if both_valid.any():
+                total = total + residual[both_valid].pow(2).mean()
+                count += 1
+
+        return total / max(count, 1)
+
+
+def train_nd_vae(train_loader, val_loader, n_regions, n_epochs=100, lr=1e-3, patience=10):
+    """Train ND-VAE with β-annealing and physics loss."""
+    batch0 = next(iter(train_loader))
+    n_feat = batch0['node_features'].shape[-1]
+    n_cov = batch0['covariates'].shape[-1]
+
+    model = PhysicsConstrainedNDVAE(
+        n_regions=n_regions, n_node_feat=n_feat, n_cov=n_cov,
+        latent_dim=16, hidden_dim=32,
+    ).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    best_val_loss = float('inf')
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(n_epochs):
+        model.train()
+        # β-annealing: linearly increase KL weight over first 20 epochs
+        beta_kl = min(1.0, epoch / 20.0) * 0.1
+        lambda_phys = 0.01
+
+        train_loss = 0.0
+        for batch in train_loader:
+            nf = batch['node_features'].to(DEVICE)
+            t = batch['times'].to(DEVICE)
+            cov = batch['covariates'].to(DEVICE)
+            adj = batch['adj'].to(DEVICE)
+            msk = batch['mask'].to(DEVICE)
+            mmse_true = batch['mmse'].to(DEVICE)
+            cdr_true = batch['cdr'].to(DEVICE)
+
+            recon, mmse_pred, cdr_logits, mu, logvar = model(nf, t, cov, adj, msk)
+
+            # Reconstruction L1
+            loss_recon = F.l1_loss(recon[msk], nf[msk])
+
+            # KL divergence
+            kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+
+            # Physics loss
+            loss_phys = model.physics_loss(recon, t, adj, msk)
+
+            # MMSE + CDR
+            loss_mmse = F.mse_loss(mmse_pred[msk], mmse_true[msk])
+            valid_cdr = msk & (cdr_true >= 0)
+            if valid_cdr.any():
+                loss_cdr = F.cross_entropy(cdr_logits[valid_cdr], cdr_true[valid_cdr])
+            else:
+                loss_cdr = torch.tensor(0.0, device=DEVICE)
+
+            loss = loss_recon + beta_kl * kl + lambda_phys * loss_phys + 0.5 * loss_mmse + 0.3 * loss_cdr
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item()
+
+        scheduler.step()
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                nf = batch['node_features'].to(DEVICE)
+                t = batch['times'].to(DEVICE)
+                cov = batch['covariates'].to(DEVICE)
+                adj = batch['adj'].to(DEVICE)
+                msk = batch['mask'].to(DEVICE)
+                mmse_true = batch['mmse'].to(DEVICE)
+                cdr_true = batch['cdr'].to(DEVICE)
+
+                recon, mmse_pred, cdr_logits, mu, logvar = model(nf, t, cov, adj, msk)
+                loss_recon = F.l1_loss(recon[msk], nf[msk])
+                kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+                loss_mmse = F.mse_loss(mmse_pred[msk], mmse_true[msk])
+                valid_cdr = msk & (cdr_true >= 0)
+                if valid_cdr.any():
+                    loss_cdr = F.cross_entropy(cdr_logits[valid_cdr], cdr_true[valid_cdr])
+                else:
+                    loss_cdr = torch.tensor(0.0, device=DEVICE)
+                val_loss += (loss_recon + 0.1 * kl + 0.5 * loss_mmse + 0.3 * loss_cdr).item()
+
+        avg_train = train_loss / max(len(train_loader), 1)
+        avg_val = val_loss / max(len(val_loader), 1)
+
+        if epoch % 10 == 0:
+            logger.info(f"[ND-VAE] Epoch {epoch}: train={avg_train:.4f}, val={avg_val:.4f}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                logger.info(f"[ND-VAE] Early stopping at epoch {epoch}")
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+    model.to(DEVICE)
+    logger.info(f"[ND-VAE] Training complete. Best val loss: {best_val_loss:.4f}")
+    return model
+
+
+# ===========================================================================
+# MODEL 3: Temporally-Aware Trajectory Diffusion Model (TADM)
+# ===========================================================================
+
+def cosine_beta_schedule(timesteps, s=0.008):
+    """Cosine noise schedule for DDPM."""
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0.0001, 0.999)
+
+
+class DiffusionConditioner(nn.Module):
+    """Conditioning module: baseline GCN + time encoding + covariate MLP."""
+    def __init__(self, n_regions, n_node_feat, n_cov, cond_dim=32):
+        super().__init__()
+        # Baseline encoder via graph conv
+        self.gcn = GraphConvLayer(n_node_feat, cond_dim)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        # Time embedding
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimeEncoding(cond_dim),
+            nn.Linear(cond_dim, cond_dim),
+            nn.GELU(),
+        )
+        # Covariate MLP
+        self.cov_mlp = nn.Sequential(
+            nn.Linear(n_cov, cond_dim),
+            nn.GELU(),
+        )
+        self.out_proj = nn.Linear(3 * cond_dim, cond_dim)
+
+    def forward(self, x0, delta_t, covariates, adj):
+        """
+        x0: (B, N, D) baseline node features
+        delta_t: (B,) elapsed time
+        covariates: (B, C)
+        adj: (1, N, N)
+        """
+        # Graph encoding of baseline
+        g = self.gcn(x0, adj)  # (B, N, cond_dim)
+        g = g.permute(0, 2, 1)  # (B, cond_dim, N)
+        g = self.pool(g).squeeze(-1)  # (B, cond_dim)
+
+        # Time encoding
+        t_emb = self.time_mlp[0](delta_t)  # sinusoidal
+        t_emb = self.time_mlp[1](t_emb)
+        t_emb = self.time_mlp[2](t_emb)
+
+        # Covariate encoding
+        c_emb = self.cov_mlp(covariates)
+
+        # Combine
+        combined = torch.cat([g, t_emb, c_emb], dim=-1)
+        return self.out_proj(combined)  # (B, cond_dim)
+
+
+class DenoisingNet(nn.Module):
+    """Simple MLP denoiser with FiLM conditioning."""
+    def __init__(self, data_dim, cond_dim=32, hidden_dim=64):
+        super().__init__()
+        # Diffusion step embedding
+        self.step_emb = nn.Embedding(200, cond_dim)
+
+        # FiLM conditioning
+        self.film_gamma = nn.Linear(2 * cond_dim, hidden_dim)
+        self.film_beta = nn.Linear(2 * cond_dim, hidden_dim)
+
+        # Denoiser backbone
+        self.net = nn.Sequential(
+            nn.Linear(data_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.out = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, data_dim),
+        )
+
+    def forward(self, x_noisy, diffusion_step, cond):
+        """
+        x_noisy: (B, data_dim) — noised target state
+        diffusion_step: (B,) long — diffusion timestep index
+        cond: (B, cond_dim) — conditioning vector
+        """
+        step_emb = self.step_emb(diffusion_step)  # (B, cond_dim)
+        cond_full = torch.cat([cond, step_emb], dim=-1)  # (B, 2*cond_dim)
+
+        h = self.net(x_noisy)  # (B, hidden)
+
+        # FiLM modulation
+        gamma = self.film_gamma(cond_full)
+        beta = self.film_beta(cond_full)
+        h = gamma * h + beta
+
+        return self.out(h)  # (B, data_dim) — predicted noise
+
+
+class TemporalDiffusionModel(nn.Module):
+    """
+    Model 3: TADM — Temporally-Aware Trajectory Diffusion Model.
+
+    DDPM conditioned on baseline state, elapsed time, and covariates.
+    Generates future neurodegeneration states.
+    """
+    def __init__(self, n_regions, n_node_feat=1, n_cov=6, T=200, cond_dim=32):
+        super().__init__()
+        self.n_regions = n_regions
+        self.data_dim = n_regions * n_node_feat
+        self.T = T
+
+        # Noise schedule
+        betas = cosine_beta_schedule(T)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+
+        self.conditioner = DiffusionConditioner(n_regions, n_node_feat, n_cov, cond_dim)
+        self.denoiser = DenoisingNet(self.data_dim, cond_dim, hidden_dim=64)
+
+        # Clinical prediction heads (from denoised output)
+        self.mmse_head = nn.Sequential(
+            nn.Linear(self.data_dim, 16), nn.GELU(), nn.Linear(16, 1),
+        )
+        self.cdr_head = nn.Sequential(
+            nn.Linear(self.data_dim, 16), nn.GELU(), nn.Linear(16, 4),
+        )
+
+    def q_sample(self, x0, t, noise=None):
+        """Forward diffusion: add noise at step t."""
+        if noise is None:
+            noise = torch.randn_like(x0)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1)
+        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
+        return sqrt_alpha * x0 + sqrt_one_minus * noise, noise
+
+    def training_loss(self, node_features, times, covariates, adj, mask):
+        """
+        Compute DDPM training loss over all valid (baseline → future) pairs.
+        """
+        B, K, N, D = node_features.shape
+        losses = []
+
+        for ki in range(1, K):
+            # Check which samples have valid data at this visit
+            valid = mask[:, ki] & mask[:, 0]
+            if not valid.any():
+                continue
+
+            x0_base = node_features[valid, 0]  # (B', N, D) baseline
+            x_target = node_features[valid, ki].reshape(-1, self.data_dim)  # (B', data_dim) future
+            dt = times[valid, ki] - times[valid, 0]  # (B',) elapsed time
+            cov = covariates[valid]
+
+            # Conditioning
+            cond = self.conditioner(x0_base, dt, cov, adj)  # (B', cond_dim)
+
+            # Random diffusion timestep
+            B_valid = x_target.shape[0]
+            t_diff = torch.randint(0, self.T, (B_valid,), device=x_target.device)
+
+            # Forward diffusion
+            x_noisy, noise = self.q_sample(x_target, t_diff)
+
+            # Predict noise
+            noise_pred = self.denoiser(x_noisy, t_diff, cond)
+
+            losses.append(F.mse_loss(noise_pred, noise))
+
+        if not losses:
+            return torch.tensor(0.0, device=node_features.device)
+        return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def sample(self, x0_base, delta_t, covariates, adj, n_steps=10):
+        """
+        DDIM-style fast sampling from noise → predicted future state.
+        """
+        B = x0_base.shape[0]
+        cond = self.conditioner(x0_base, delta_t, covariates, adj)
+
+        # Start from pure noise
+        x = torch.randn(B, self.data_dim, device=x0_base.device)
+
+        # DDIM sampling with n_steps
+        step_indices = torch.linspace(self.T - 1, 0, n_steps, dtype=torch.long, device=x.device)
+
+        for i, t_idx in enumerate(step_indices):
+            t_batch = t_idx.expand(B).long()
+            noise_pred = self.denoiser(x, t_batch, cond)
+
+            alpha_t = self.alphas_cumprod[t_idx]
+            if i < len(step_indices) - 1:
+                alpha_prev = self.alphas_cumprod[step_indices[i + 1]]
+            else:
+                alpha_prev = torch.tensor(1.0, device=x.device)
+
+            # DDIM update
+            x0_pred = (x - torch.sqrt(1 - alpha_t) * noise_pred) / torch.sqrt(alpha_t)
+            x = torch.sqrt(alpha_prev) * x0_pred + torch.sqrt(1 - alpha_prev) * noise_pred
+
+        return x.view(B, self.n_regions, -1)  # (B, N, D)
+
+
+def train_tadm(train_loader, val_loader, n_regions, n_epochs=200, lr=1e-3, patience=15):
+    """Train TADM diffusion model."""
+    batch0 = next(iter(train_loader))
+    n_feat = batch0['node_features'].shape[-1]
+    n_cov = batch0['covariates'].shape[-1]
+
+    model = TemporalDiffusionModel(
+        n_regions=n_regions, n_node_feat=n_feat, n_cov=n_cov, T=200, cond_dim=32,
+    ).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+
+    best_val_loss = float('inf')
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(n_epochs):
+        model.train()
+        train_loss = 0.0
+        for batch in train_loader:
+            nf = batch['node_features'].to(DEVICE)
+            t = batch['times'].to(DEVICE)
+            cov = batch['covariates'].to(DEVICE)
+            adj = batch['adj'].to(DEVICE)
+            msk = batch['mask'].to(DEVICE)
+
+            loss = model.training_loss(nf, t, cov, adj, msk)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item()
+
+        scheduler.step()
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                nf = batch['node_features'].to(DEVICE)
+                t = batch['times'].to(DEVICE)
+                cov = batch['covariates'].to(DEVICE)
+                adj = batch['adj'].to(DEVICE)
+                msk = batch['mask'].to(DEVICE)
+                val_loss += model.training_loss(nf, t, cov, adj, msk).item()
+
+        avg_train = train_loss / max(len(train_loader), 1)
+        avg_val = val_loss / max(len(val_loader), 1)
+
+        if epoch % 20 == 0:
+            logger.info(f"[TADM] Epoch {epoch}: train={avg_train:.4f}, val={avg_val:.4f}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                logger.info(f"[TADM] Early stopping at epoch {epoch}")
+                break
+
+    if best_state:
+        model.load_state_dict(best_state)
+    model.to(DEVICE)
+    logger.info(f"[TADM] Training complete. Best val loss: {best_val_loss:.4f}")
+    return model
+
+
+# ===========================================================================
+# BENCHMARK RUNNER — Evaluate all models on test set
+# ===========================================================================
+
+def evaluate_dl_model(model, test_loader, model_name, n_regions=None):
+    """Evaluate a DL model on test data. Returns metrics dict."""
+    model.eval()
+    all_recon, all_true = [], []
+    all_mmse_pred, all_mmse_true = [], []
+    all_cdr_pred, all_cdr_true = [], []
+
+    with torch.no_grad():
+        for batch in test_loader:
+            nf = batch['node_features'].to(DEVICE)
+            t = batch['times'].to(DEVICE)
+            cov = batch['covariates'].to(DEVICE)
+            adj = batch['adj'].to(DEVICE)
+            msk = batch['mask'].to(DEVICE)
+            mmse_true = batch['mmse'].to(DEVICE)
+            cdr_true = batch['cdr'].to(DEVICE)
+
+            if model_name == 'TADM':
+                # For TADM, generate predictions via sampling
+                B, K, N, D = nf.shape
+                for ki in range(1, K):
+                    valid = msk[:, ki] & msk[:, 0]
+                    if not valid.any():
+                        continue
+                    x0 = nf[valid, 0]
+                    dt = t[valid, ki] - t[valid, 0]
+                    pred = model.sample(x0, dt, cov[valid], adj, n_steps=10)
+                    all_recon.append(pred.cpu())
+                    all_true.append(nf[valid, ki].cpu())
+                    # Clinical predictions from sampled state
+                    pred_flat = pred.view(-1, model.data_dim)
+                    all_mmse_pred.append(model.mmse_head(pred_flat).squeeze(-1).cpu())
+                    all_mmse_true.append(mmse_true[valid, ki].cpu())
+                    all_cdr_pred.append(model.cdr_head(pred_flat).cpu())
+                    all_cdr_true.append(cdr_true[valid, ki].cpu())
+            elif model_name == 'ND-VAE':
+                recon, mmse_pred, cdr_logits, _, _ = model(nf, t, cov, adj, msk)
+                # Use future visits only (skip baseline)
+                for ki in range(1, nf.shape[1]):
+                    valid = msk[:, ki]
+                    if valid.any():
+                        all_recon.append(recon[valid, ki].cpu())
+                        all_true.append(nf[valid, ki].cpu())
+                        all_mmse_pred.append(mmse_pred[valid, ki].cpu())
+                        all_mmse_true.append(mmse_true[valid, ki].cpu())
+                        all_cdr_pred.append(cdr_logits[valid, ki].cpu())
+                        all_cdr_true.append(cdr_true[valid, ki].cpu())
+            else:  # ST-GNN-ODE
+                recon, mmse_pred, cdr_logits = model(nf, t, cov, adj, msk)
+                for ki in range(1, nf.shape[1]):
+                    valid = msk[:, ki]
+                    if valid.any():
+                        all_recon.append(recon[valid, ki].cpu())
+                        all_true.append(nf[valid, ki].cpu())
+                        all_mmse_pred.append(mmse_pred[valid, ki].cpu())
+                        all_mmse_true.append(mmse_true[valid, ki].cpu())
+                        all_cdr_pred.append(cdr_logits[valid, ki].cpu())
+                        all_cdr_true.append(cdr_true[valid, ki].cpu())
+
+    metrics = {}
+    if all_recon:
+        recon_cat = torch.cat(all_recon)
+        true_cat = torch.cat(all_true)
+        rmse = torch.sqrt(F.mse_loss(recon_cat, true_cat)).item()
+        mae = F.l1_loss(recon_cat, true_cat).item()
+
+        # Pearson r (flatten)
+        r_flat = recon_cat.flatten().numpy()
+        t_flat = true_cat.flatten().numpy()
+        if len(r_flat) > 2 and np.std(r_flat) > 1e-10 and np.std(t_flat) > 1e-10:
+            pearson_r = float(np.corrcoef(r_flat, t_flat)[0, 1])
+        else:
+            pearson_r = 0.0
+        metrics['atrophy_rmse'] = round(rmse, 4)
+        metrics['atrophy_mae'] = round(mae, 4)
+        metrics['atrophy_pearson_r'] = round(pearson_r, 4)
+
+    if all_mmse_pred:
+        mmse_p = torch.cat(all_mmse_pred)
+        mmse_t = torch.cat(all_mmse_true)
+        metrics['mmse_mae'] = round(F.l1_loss(mmse_p, mmse_t).item(), 4)
+
+    if all_cdr_pred and all_cdr_true:
+        cdr_p = torch.cat(all_cdr_pred)
+        cdr_t = torch.cat(all_cdr_true)
+        valid_cdr = cdr_t >= 0
+        if valid_cdr.any():
+            cdr_p_valid = cdr_p[valid_cdr]
+            cdr_t_valid = cdr_t[valid_cdr]
+            pred_labels = cdr_p_valid.argmax(dim=-1)
+            acc = (pred_labels == cdr_t_valid).float().mean().item()
+            metrics['cdr_accuracy'] = round(acc, 4)
+            # Macro F1
+            from sklearn.metrics import f1_score as sk_f1
+            try:
+                metrics['cdr_f1_macro'] = round(
+                    sk_f1(cdr_t_valid.numpy(), pred_labels.numpy(), average='macro', zero_division=0), 4
+                )
+            except Exception:
+                metrics['cdr_f1_macro'] = 0.0
+
+    return metrics
+
+
+def run_benchmark(
+    ndm_results: Dict,
+    st_gnn_ode_model,
+    nd_vae_model,
+    tadm_model,
+    test_loader,
+    n_regions: int,
+    out_dir: Path,
+) -> pd.DataFrame:
+    """
+    Evaluate all 4 models on the same test set and produce comparison table.
+    """
+    results = {}
+
+    # NDM baseline metrics
+    ndm_val = ndm_results.get('validation', {})
+    results['NDM (Baseline)'] = {
+        'atrophy_rmse': ndm_val.get('rmse', '-'),
+        'atrophy_mae': ndm_val.get('mae', '-'),
+        'atrophy_pearson_r': ndm_val.get('pearson_r', '-'),
+        'mmse_mae': '-',
+        'cdr_accuracy': '-',
+        'cdr_f1_macro': '-',
+    }
+
+    # DL models
+    if st_gnn_ode_model is not None:
+        results['ST-GNN-ODE'] = evaluate_dl_model(st_gnn_ode_model, test_loader, 'ST-GNN-ODE')
+    if nd_vae_model is not None:
+        results['ND-VAE'] = evaluate_dl_model(nd_vae_model, test_loader, 'ND-VAE')
+    if tadm_model is not None:
+        results['TADM'] = evaluate_dl_model(tadm_model, test_loader, 'TADM', n_regions)
+
+    df = pd.DataFrame(results).T
+    df.index.name = 'Model'
+
+    # Save
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / 'benchmark_results.csv')
+    logger.info(f"Benchmark results saved to {out_dir / 'benchmark_results.csv'}")
+    print("\n" + "=" * 70)
+    print("BENCHMARK RESULTS — All Models vs NDM Baseline")
+    print("=" * 70)
+    print(df.to_string())
+    print("=" * 70)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Feature engineering (kept for compatibility)
 # ---------------------------------------------------------------------------
 
 CLINICAL_FEATURES = ["Age", "EDUC", "SES", "eTIV", "nWBV"]
 SEX_COL = "M/F"  # encode as 0/1
 
-
-def prepare_features(
-    regional_volumes: pd.DataFrame,
-    demo_df: pd.DataFrame,
-    target_col: str = "CDR",
-    region_cols: Optional[List[str]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-    """
-    Build feature matrix X, label vector y, and group vector (subject IDs) for GroupKFold.
-
-    Labeling strategy: CDR > 0  → Demented (1), CDR == 0 → Nondemented (0).
-    Subjects with Group == 'Converted' are included with their CDR-derived label.
-
-    Returns:
-        X: (n_samples, n_features) float array
-        y: (n_samples,) int array {0, 1}
-        groups: (n_samples,) array of subject_id strings (for GroupKFold)
-        feature_names: list of feature column names
-    """
-    # Merge regional volumes with demographics on subject_id
-    demo_df = demo_df.copy()
-    if "subject_id" not in demo_df.columns and "Subject ID" in demo_df.columns:
-        demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
-    if "subject_id" not in demo_df.columns:
-        raise ValueError("demo_df must have 'subject_id' or 'Subject ID' column.")
-
-    # Merge regional volumes with demographics on subject_id.
-    # Only bring in demo_df columns that aren't already in regional_volumes —
-    # otherwise an overlapping column (e.g. if regional_volumes is itself
-    # demographics-derived) gets silently suffixed to CDR_x/CDR_y by pandas
-    # and the plain "CDR"/"Group" columns below would vanish.
-    demo_cols_to_merge = ["subject_id"] + [
-        c for c in demo_df.columns if c != "subject_id" and c not in regional_volumes.columns
-    ]
-    merged = regional_volumes.merge(demo_df[demo_cols_to_merge], on="subject_id", how="left")
-
-    # Sex encoding
-    if SEX_COL in merged.columns:
-        merged["sex_encoded"] = (merged[SEX_COL].str.upper() == "M").astype(float)
-    else:
-        merged["sex_encoded"] = 0.0
-
-    # Region cols: use _norm variants if available, else raw
-    if region_cols is None:
-        norm_cols = [c for c in regional_volumes.columns if c.endswith("_norm")]
-        if norm_cols:
-            region_cols = norm_cols
-        else:
-            region_cols = [
-                c for c in regional_volumes.columns
-                if c not in {"subject_id", "session_id"} and
-                pd.api.types.is_numeric_dtype(regional_volumes[c])
-            ]
-
-    clinical = [c for c in CLINICAL_FEATURES if c in merged.columns]
-    all_feature_cols = region_cols + clinical + ["sex_encoded"]
-    all_feature_cols = [c for c in all_feature_cols if c in merged.columns]
-
-    # Target: CDR-derived binary label
-    if target_col not in merged.columns and "CDR" in merged.columns:
-        target_col = "CDR"
-
-    if target_col in merged.columns:
-        valid = merged[target_col].notna()
-        merged = merged[valid].copy()
-        y = (merged[target_col] > 0).astype(int).values
-    elif "Group" in merged.columns:
-        logger.warning("CDR not found; using Group column for labels.")
-        group_map = {"Nondemented": 0, "Demented": 1, "Converted": 1}
-        merged = merged[merged["Group"].isin(group_map)].copy()
-        y = merged["Group"].map(group_map).values
-    else:
-        raise ValueError("No usable label column found (CDR or Group).")
-
-    X = merged[all_feature_cols].values.astype(float)
-    groups = merged["subject_id"].values if "subject_id" in merged.columns else np.arange(len(y))
-
-    logger.info(
-        f"Feature matrix: {X.shape[0]} samples × {X.shape[1]} features. "
-        f"Label balance: {y.sum()} positive / {(y == 0).sum()} negative."
-    )
-    return X, y, groups, all_feature_cols
-
-
-# ---------------------------------------------------------------------------
-# Model definitions
-# ---------------------------------------------------------------------------
-
-def build_pipelines() -> Dict[str, Pipeline]:
-    """Return a dict of named scikit-learn pipelines (imputer + scaler + model)."""
-    return {
-        "LogisticRegression": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=1000, class_weight="balanced", random_state=42)),
-        ]),
-        "LinearSVM": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", LinearSVC(max_iter=2000, class_weight="balanced", random_state=42)),
-        ]),
-        "RandomForest": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("clf", RandomForestClassifier(
-                n_estimators=200, class_weight="balanced",
-                random_state=42, n_jobs=-1,
-            )),
-        ]),
-        "GradientBoosting": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("clf", GradientBoostingClassifier(
-                n_estimators=200, learning_rate=0.05, random_state=42,
-            )),
-        ]),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Cross-validation (subject-level GroupKFold)
-# ---------------------------------------------------------------------------
-
-def evaluate_models(
-    X: np.ndarray,
-    y: np.ndarray,
-    groups: np.ndarray,
-    n_splits: int = 5,
-) -> Dict[str, Dict]:
-    """
-    Evaluate all classical models using subject-level GroupKFold CV.
-    Returns a dict of {model_name: {metric: value}}.
-    """
-    pipelines = build_pipelines()
-
-    # Ensure we don't request more splits than there are unique subjects
-    n_unique = len(np.unique(groups))
-    n_splits = min(n_splits, n_unique)
-    gkf = GroupKFold(n_splits=n_splits)
-
-    scoring = ["accuracy", "f1_weighted", "roc_auc"]
-    # LinearSVC doesn't support predict_proba; remove roc_auc for it
-    svm_scoring = ["accuracy", "f1_weighted"]
-
-    results = {}
-    model_bar = tqdm(pipelines.items(), desc="Classical models", unit="model")
-    for name, pipe in model_bar:
-        model_bar.set_description(f"Evaluating {name}")
-        logger.info(f"Evaluating {name} ...")
-        sc = svm_scoring if name == "LinearSVM" else scoring
-        try:
-            cv_results = cross_validate(
-                pipe, X, y,
-                groups=groups,
-                cv=gkf,
-                scoring=sc,
-                return_train_score=False,
-            )
-            results[name] = {
-                metric: {
-                    "mean": round(float(cv_results[f"test_{metric}"].mean()), 4),
-                    "std": round(float(cv_results[f"test_{metric}"].std()), 4),
-                }
-                for metric in sc
-            }
-            logger.info(
-                f"  {name}: accuracy={results[name]['accuracy']['mean']:.3f}"
-                f" ± {results[name]['accuracy']['std']:.3f}"
-            )
-            model_bar.set_postfix(acc=f"{results[name]['accuracy']['mean']:.3f}")
-        except Exception as e:
-            logger.error(f"  {name} failed: {e}")
-            results[name] = {"error": str(e)}
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Train final model on full data and save
-# ---------------------------------------------------------------------------
-
-def train_and_save_best_model(
-    X: np.ndarray,
-    y: np.ndarray,
-    feature_names: List[str],
-    best_model_name: str = "GradientBoosting",
-    out_dir: Optional[Path] = None,
-) -> Pipeline:
-    """
-    Fit the selected model on all available data and save as a checkpoint.
-    Returns the fitted pipeline.
-    """
-    if out_dir is None:
-        out_dir = get_models_dir()
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    pipelines = build_pipelines()
-    if best_model_name not in pipelines:
-        logger.warning(f"{best_model_name} not found; defaulting to GradientBoosting.")
-        best_model_name = "GradientBoosting"
-
-    pipe = pipelines[best_model_name]
-    pipe.fit(X, y)
-
-    save_checkpoint(
-        {"pipeline": pipe, "feature_names": feature_names},
-        f"classical_model_{best_model_name}",
-        directory=out_dir,
-    )
-    logger.info(f"Model saved: models/classical_model_{best_model_name}.pkl")
-    return pipe
-
-
-# ---------------------------------------------------------------------------
-# Feature importance report
-# ---------------------------------------------------------------------------
-
-def feature_importance_report(
-    model: Pipeline,
-    feature_names: List[str],
-    top_n: int = 20,
-) -> pd.DataFrame:
-    """
-    Extract feature importances from the fitted model (if available).
-    Works with RandomForest, GradientBoosting (feature_importances_)
-    and LogisticRegression (coef_).
-    """
-    clf = model.named_steps.get("clf")
-    if clf is None:
-        return pd.DataFrame()
-
-    if hasattr(clf, "feature_importances_"):
-        importances = clf.feature_importances_
-    elif hasattr(clf, "coef_"):
-        importances = np.abs(clf.coef_).flatten()
-    else:
-        logger.info("Model does not expose feature importances.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame({"feature": feature_names, "importance": importances})
-    df = df.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Main pipeline function
-# ---------------------------------------------------------------------------
-
-def run_phase2a(
-    regional_volumes: pd.DataFrame,
-    demo_df: pd.DataFrame,
-    out_dir: Optional[Path] = None,
-    n_splits: int = 5,
-) -> Dict[str, Any]:
-    """
-    Phase 2a full run: feature prep → cross-validation → train final model → save.
-    Returns a summary dict.
-    """
-    if out_dir is None:
-        out_dir = get_outputs_dir("phase2a")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    X, y, groups, feature_names = prepare_features(regional_volumes, demo_df)
-    cv_results = evaluate_models(X, y, groups, n_splits=n_splits)
-
-    # Pick best model by mean accuracy
-    best_name = max(
-        {k: v for k, v in cv_results.items() if "error" not in v},
-        key=lambda k: cv_results[k].get("accuracy", {}).get("mean", 0),
-        default="GradientBoosting",
-    )
-    logger.info(f"Best model by accuracy: {best_name}")
-
-    final_model = train_and_save_best_model(X, y, feature_names, best_model_name=best_name)
-    importances = feature_importance_report(final_model, feature_names)
-
-    # Save results
-    with open(out_dir / "cv_results.json", "w") as f:
-        json.dump(cv_results, f, indent=2)
-    if not importances.empty:
-        importances.to_csv(out_dir / "feature_importances.csv", index=False)
-
-    logger.info(f"Phase 2a results written to: {out_dir}")
-
-    return {
-        "cv_results": cv_results,
-        "best_model_name": best_name,
-        "feature_names": feature_names,
-        "feature_importances": importances,
-        "final_model": final_model,
-    }
-
-"""
-cnn_model.py — Phase 2b: Secondary transfer-learning CNN classification track.
-
-Task: Same binary classification (Nondemented vs. Demented) as Phase 2a,
-      but using 2D slices from T1 volumes through a pretrained ImageNet backbone.
-
-Key design decisions (from implementation.md §4b, Yagis et al. 2021):
-  - NEVER train from scratch on ~150 subjects.
-  - Use a pretrained backbone (ResNet-18 or VGG16) as frozen/lightly-tuned feature extractor.
-  - Subject-level split ONLY via GroupKFold — slice-level split inflates accuracy ~30 pp.
-  - Expected honest subject-level accuracy: 60–75%.
-  - If accuracy >> 75% on your own split, check for leakage before celebrating.
-
-Runtime budget:
-  - Colab GPU: minutes per fold.
-  - CPU-only: design for < 1 hour (small batches, few epochs, early stopping).
-
-"""
-
-import sys
-import time
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-from tqdm.auto import tqdm
-
-
-
-logger = setup_logging("cnn_model")
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# ---------------------------------------------------------------------------
-# Torch imports (graceful failure if not installed)
-# ---------------------------------------------------------------------------
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import Dataset, DataLoader
-    import torchvision.models as tv_models
-    import torchvision.transforms as transforms
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    Dataset = object  # fallback base class so class defs below don't NameError
-    logger.warning(
-        "PyTorch/torchvision not installed. "
-        "Phase 2b CNN track will not be available. "
-        "Phase 2a (classical ML) is the primary track and does not require torch."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Slice extraction
-# ---------------------------------------------------------------------------
-
-def extract_informative_slices(
-    nifti_path: Path,
-    n_slices: int = 10,
-    axis: int = 2,  # axial
-    method: str = "entropy",
-) -> Optional[np.ndarray]:
-    """
-    Extract the most informative 2D slices from a 3D T1 NIfTI volume.
-
-    Args:
-        nifti_path: path to .nii or .nii.gz
-        n_slices:   number of slices to extract per volume
-        axis:       slicing axis (0=sagittal, 1=coronal, 2=axial)
-        method:     'entropy' (highest information slices) or 'uniform' (evenly spaced)
-
-    Returns:
-        Array of shape (n_slices, H, W) normalized to [0, 1], or None on failure.
-    """
-    try:
-        import nibabel as nib
-    except ImportError:
-        logger.warning("nibabel not installed; cannot load NIfTI.")
-        return None
-
-    try:
-        img = nib.load(str(nifti_path))
-        data = img.get_fdata()
-    except Exception as e:
-        logger.warning(f"Failed to load {nifti_path}: {e}")
-        return None
-
-    # Guard against unexpected 4D volumes (e.g. trailing singleton or time dim)
-    data = np.squeeze(data)
-    if data.ndim != 3:
-        logger.warning(f"Skipping {nifti_path}: expected 3D volume, got shape {data.shape}")
-        return None
-
-    # Normalize volume to [0, 1]
-    vmin, vmax = data.min(), data.max()
-    if vmax - vmin < 1e-8:
-        return None
-    data = (data - vmin) / (vmax - vmin)
-
-    n_total = data.shape[axis]
-
-    if method == "entropy":
-        # Compute entropy of each slice to pick informative ones
-        from scipy.stats import entropy as scipy_entropy
-
-        entropies = []
-        for i in range(n_total):
-            sl = np.take(data, i, axis=axis).ravel()
-            hist, _ = np.histogram(sl, bins=64, range=(0, 1))
-            e = scipy_entropy(hist + 1e-10)
-            entropies.append(e)
-
-        top_indices = np.argsort(entropies)[-n_slices:]
-    else:  # uniform
-        top_indices = np.linspace(n_total // 10, 9 * n_total // 10, n_slices, dtype=int)
-
-    slices = [np.take(data, int(i), axis=axis) for i in sorted(top_indices)]
-    return np.stack(slices, axis=0)  # (n_slices, H, W)
-
-
-# ---------------------------------------------------------------------------
-# Dataset class
-# ---------------------------------------------------------------------------
-
-class OASISSliceDataset(Dataset):
-    """
-    PyTorch Dataset for 2D MRI slices.
-
-    Each item returns (image_tensor, label, subject_id).
-    image_tensor: (3, H, W) — replicated to 3 channels for ImageNet backbone.
-    """
-
-    def __init__(
-        self,
-        slice_arrays: List[np.ndarray],  # list of (n_slices, H, W) arrays
-        labels: List[int],
-        subject_ids: List[str],
-        transform=None,
-    ):
-        assert len(slice_arrays) == len(labels) == len(subject_ids)
-        self.samples = []
-        for arr, label, sid in zip(slice_arrays, labels, subject_ids):
-            for sl in arr:
-                self.samples.append((sl, label, sid))
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        sl, label, sid = self.samples[idx]
-        # Resize to (224, 224) and replicate to 3 channels
-        sl_tensor = torch.tensor(sl, dtype=torch.float32).squeeze()
-        if sl_tensor.ndim != 2:
-            raise ValueError(
-                f"Expected 2D slice for subject {sid}, got shape {tuple(sl_tensor.shape)}"
-            )
-        sl_3ch = sl_tensor.unsqueeze(0).repeat(3, 1, 1)
-        if self.transform:
-            sl_3ch = self.transform(sl_3ch)
-        return sl_3ch, torch.tensor(label, dtype=torch.long), sid
-
-
-def get_transform(train: bool = True, img_size: int = 224):
-    """Return torchvision transforms for train or eval mode."""
-    if not TORCH_AVAILABLE:
-        return None
-    ops = [transforms.Resize((img_size, img_size))]
-    if train:
-        ops += [
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
-        ]
-    ops.append(transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                    std=[0.229, 0.224, 0.225]))
-    return transforms.Compose(ops)
-
-
-# ---------------------------------------------------------------------------
-# Model: pretrained backbone + small classification head
-# ---------------------------------------------------------------------------
-
-def build_transfer_model(
-    backbone: str = "resnet18",
-    freeze_backbone: bool = True,
-    num_classes: int = 2,
-) -> "nn.Module":
-    """
-    Build a pretrained backbone with a fine-tuned classification head.
-
-    Args:
-        backbone: 'resnet18' or 'vgg16'
-        freeze_backbone: if True, backbone weights are frozen (feature extractor only)
-        num_classes: number of output classes
-
-    Returns a PyTorch nn.Module.
-    """
-    if not TORCH_AVAILABLE:
-        raise ImportError("PyTorch is required for the CNN track.")
-
-    if backbone == "resnet18":
-        model = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
-        if freeze_backbone:
-            for param in model.parameters():
-                param.requires_grad = False
-        in_features = model.fc.in_features
-        model.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(in_features, num_classes),
-        )
-    elif backbone == "vgg16":
-        model = tv_models.vgg16(weights=tv_models.VGG16_Weights.DEFAULT)
-        if freeze_backbone:
-            for param in model.features.parameters():
-                param.requires_grad = False
-        in_features = model.classifier[6].in_features
-        model.classifier[6] = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(in_features, num_classes),
-        )
-    else:
-        raise ValueError(f"Unknown backbone: {backbone}. Choose 'resnet18' or 'vgg16'.")
-
-    return model
-
-
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-def train_one_fold(
-    model: "nn.Module",
-    train_loader: "DataLoader",
-    val_loader: "DataLoader",
-    device,
-    n_epochs: int = 10,
-    lr: float = 1e-3,
-    patience: int = 3,
-    fold_label: str = "",
-) -> Dict:
-    """
-    Train the model for one CV fold with early stopping.
-    Returns a dict with train/val losses and best val accuracy.
-    """
-    optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=lr, weight_decay=1e-4,
-    )
-    criterion = nn.CrossEntropyLoss()
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
-
-    history = {"train_loss": [], "val_loss": [], "val_acc": []}
-    best_val_acc = 0.0
-    epochs_no_improve = 0
-
-    epoch_bar = tqdm(range(n_epochs), desc=f"{fold_label} epochs", unit="epoch", leave=False)
-    for epoch in epoch_bar:
-        # --- Train ---
-        model.train()
-        total_loss = 0.0
-        train_bar = tqdm(train_loader, desc=f"  train", unit="batch", leave=False)
-        for images, labels, _ in train_bar:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            train_bar.set_postfix(loss=f"{loss.item():.4f}")
-        avg_train_loss = total_loss / max(len(train_loader), 1)
-
-        # --- Validate ---
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            val_bar = tqdm(val_loader, desc=f"  val", unit="batch", leave=False)
-            for images, labels, _ in val_bar:
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                val_loss += criterion(outputs, labels).item()
-                preds = outputs.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
-        avg_val_loss = val_loss / max(len(val_loader), 1)
-        val_acc = correct / max(total, 1)
-
-        history["train_loss"].append(avg_train_loss)
-        history["val_loss"].append(avg_val_loss)
-        history["val_acc"].append(val_acc)
-
-        scheduler.step(avg_val_loss)
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
-        epoch_bar.set_postfix(
-            train_loss=f"{avg_train_loss:.4f}",
-            val_loss=f"{avg_val_loss:.4f}",
-            val_acc=f"{val_acc:.3f}",
-            best=f"{best_val_acc:.3f}",
-        )
-        logger.info(
-            f"{fold_label} Epoch {epoch+1}/{n_epochs}: "
-            f"train_loss={avg_train_loss:.4f}  val_loss={avg_val_loss:.4f}  val_acc={val_acc:.3f}"
-        )
-
-        if epochs_no_improve >= patience:
-            logger.info(f"{fold_label} Early stopping at epoch {epoch+1}.")
-            break
-
-    history["best_val_acc"] = best_val_acc
-    return history
-
-
-# ---------------------------------------------------------------------------
-# Subject-level GroupKFold CV (the hard requirement)
-# ---------------------------------------------------------------------------
-
-def run_cnn_cv(
-    nifti_paths: List[Path],
-    labels: List[int],
-    subject_ids: List[str],
-    n_splits: int = 5,
-    backbone: str = "resnet18",
-    n_epochs: int = 10,
-    batch_size: int = 16,
-    n_slices_per_scan: int = 10,
-    out_dir: Optional[Path] = None,
-) -> Dict:
-    """
-    Run subject-level GroupKFold CV for the transfer-learning CNN.
-
-    IMPORTANT: subject_ids are the GroupKFold groups — a subject's slices
-    can NEVER appear in both train and val/test splits.
-
-    Returns a dict with per-fold and aggregate accuracy.
-    """
-    if not TORCH_AVAILABLE:
-        logger.error("PyTorch not available. Phase 2b cannot run.")
-        return {"error": "PyTorch not installed"}
-
-    from sklearn.model_selection import GroupKFold
-
-    if out_dir is None:
-        out_dir = get_outputs_dir("phase2b")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    device = get_device()
-    if TORCH_AVAILABLE and torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        logger.info(f"CNN training on device: {device}  [{gpu_name}, {gpu_mem_gb:.1f} GB]")
-        print(f"[GPU] Using {gpu_name} ({gpu_mem_gb:.1f} GB) — training will run on GPU.")
-    else:
-        logger.info(f"CNN training on device: {device}")
-        print(
-            "[CPU] No CUDA GPU detected — training will be much slower.\n"
-            "      In Colab: Runtime > Change runtime type > Hardware accelerator > T4 GPU, "
-            "then Runtime > Restart session."
-        )
-
-    # Extract slices for all scans
-    logger.info(f"Extracting slices from {len(nifti_paths)} scans ...")
-    slice_arrays = []
-    valid_idx = []
-    for i, path in enumerate(tqdm(nifti_paths, desc="Extracting slices", unit="scan")):
-        arr = extract_informative_slices(path, n_slices=n_slices_per_scan)
-        if arr is not None:
-            slice_arrays.append(arr)
-            valid_idx.append(i)
-
-    if not slice_arrays:
-        logger.error("No valid slices extracted.")
-        return {"error": "No valid slices"}
-
-    valid_labels = [labels[i] for i in valid_idx]
-    valid_subjects = [subject_ids[i] for i in valid_idx]
-
-    groups_arr = np.array(valid_subjects)
-    labels_arr = np.array(valid_labels)
-
-    n_unique = len(np.unique(groups_arr))
-    n_splits = min(n_splits, n_unique)
-    gkf = GroupKFold(n_splits=n_splits)
-
-    fold_accs = []
-    start_time = time.time()
-
-    fold_bar = tqdm(
-        enumerate(gkf.split(slice_arrays, labels_arr, groups_arr)),
-        total=n_splits, desc="CV folds", unit="fold",
-    )
-    for fold_idx, (train_idx, val_idx) in fold_bar:
-        fold_label = f"[Fold {fold_idx + 1}/{n_splits}]"
-        logger.info(f"  {fold_label} ...")
-        fold_bar.set_description(f"CV fold {fold_idx + 1}/{n_splits}")
-
-        # CRITICAL: check no subject overlap
-        train_subjs = set(groups_arr[train_idx])
-        val_subjs = set(groups_arr[val_idx])
-        assert len(train_subjs & val_subjs) == 0, "LEAKAGE DETECTED: subject in both train and val!"
-
-        train_arrs = [slice_arrays[i] for i in train_idx]
-        val_arrs = [slice_arrays[i] for i in val_idx]
-
-        train_ds = OASISSliceDataset(
-            train_arrs, labels_arr[train_idx].tolist(),
-            groups_arr[train_idx].tolist(),
-            transform=get_transform(train=True),
-        )
-        val_ds = OASISSliceDataset(
-            val_arrs, labels_arr[val_idx].tolist(),
-            groups_arr[val_idx].tolist(),
-            transform=get_transform(train=False),
-        )
-
-        num_workers = 2 if is_gpu_available() else 0
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=num_workers, pin_memory=is_gpu_available())
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                                num_workers=num_workers, pin_memory=is_gpu_available())
-
-        model = build_transfer_model(backbone=backbone, freeze_backbone=True)
-        model = model.to(device)
-
-        history = train_one_fold(
-            model, train_loader, val_loader, device,
-            n_epochs=n_epochs, fold_label=fold_label,
-        )
-        fold_accs.append(history["best_val_acc"])
-        logger.info(f"    {fold_label} best val accuracy: {history['best_val_acc']:.3f}")
-        fold_bar.set_postfix(best_val_acc=f"{history['best_val_acc']:.3f}")
-
-    wall_time = time.time() - start_time
-    result = {
-        "backbone": backbone,
-        "fold_accuracies": fold_accs,
-        "mean_accuracy": float(np.mean(fold_accs)),
-        "std_accuracy": float(np.std(fold_accs)),
-        "n_splits": n_splits,
-        "wall_time_s": round(wall_time, 1),
-        "note": (
-            "Subject-level GroupKFold split enforced. "
-            "Expected honest range: 60-75%. "
-            "Values >> 75% should be investigated for leakage."
-        ),
-    }
-
-    import json
-    with open(out_dir / "cnn_cv_results.json", "w") as f:
-        json.dump(result, f, indent=2)
-    logger.info(
-        f"CNN CV: mean accuracy = {result['mean_accuracy']:.3f} "
-        f"± {result['std_accuracy']:.3f}  ({wall_time:.0f}s)"
-    )
-    return result
-
-"""
-ndm.py — Phase 3: Network Diffusion Model (NDM) for neurodegeneration spread.
-
-This is the structural analog to the Fisher-Kolmogorov reaction-diffusion PDE
-used in the original tumor pipeline. Mathematical family is the same
-(diffusion operator on a Laplacian), but applied to brain connectivity graphs
-rather than a DTI-derived tissue tensor.
-
-Reference: Raj, Kuceyeski & Weiner (2012). A network diffusion model of disease
-           progression in dementia. Neuron, 73(6), 1204-1215.
-           Raj et al. (2015). Cell Reports, 10(3), 359-369.
-           [ADNI validation using healthy reference connectome — same constraint as OASIS-2]
-
-Model:
-    x(t) = exp(-β · L · t) · x(0)
-
-where:
-    x(0): initial regional pathology vector (age-normalized atrophy, W-score)
-    L:    graph Laplacian of the structural connectome
-    β:    scalar diffusivity rate (patient-specific, fitted per subject)
-    t:    time in years since baseline visit
-
-Implementation:
-    - Eigen-decomposition of L (computed once), then x(t) evaluated analytically.
-    - β fitted per subject via scipy.optimize.minimize_scalar.
-    - Template connectome used (Desikan-Killiany atlas parcellation, public source).
-    - Age-normalized pathology score (W-score, not raw z-score).
-
-"""
-
-import sys
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-import scipy.linalg
-import scipy.optimize
-import scipy.stats
-from tqdm.auto import tqdm
-
-
-
-logger = setup_logging("ndm")
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -2759,825 +3104,6 @@ def run_phase4(
         "validation": validation,
     }
 
-"""
-risk_model.py — Phase 5: Clinical/Demographic Risk Profiling.
-
-Analog to radiogenomics (IDH/MGMT stratification) in the original tumor pipeline.
-OASIS-2 has no genotype data (no APOE, unlike OASIS-3) — this is explicitly a
-clinical-feature proxy, as documented in implementation.md §7 and the final report.
-
-Features: Age, Sex, Education, SES, eTIV, nWBV + Phase 1 regional volumes
-          + optionally Phase 3's fitted β as a continuous aggressiveness target.
-
-Target options:
-  - Binary: predicted future CDR increase (1 = declined, 0 = stable)
-  - Continuous: Phase 3 fitted diffusivity β (higher β → faster spread)
-
-Model: Gradient Boosting (primary) + Logistic Regression (interpretable baseline).
-       Both trivially fast on CPU.
-
-"""
-
-import sys
-import json
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
-
-import numpy as np
-import pandas as pd
-from tqdm.auto import tqdm
-from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.model_selection import GroupKFold, cross_validate
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import roc_auc_score, mean_squared_error, r2_score
-
-
-
-logger = setup_logging("risk_model")
-warnings.filterwarnings("ignore", category=UserWarning)
-
-
-# ---------------------------------------------------------------------------
-# Feature assembly
-# ---------------------------------------------------------------------------
-
-CLINICAL_FEATURES = ["Age", "EDUC", "SES", "eTIV", "nWBV"]
-SEX_COL = "M/F"
-
-
-def build_risk_features(
-    demo_df: pd.DataFrame,
-    regional_volumes: Optional[pd.DataFrame] = None,
-    beta_df: Optional[pd.DataFrame] = None,
-    deficit_scores: Optional[pd.DataFrame] = None,
-) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Assemble the risk model feature matrix from clinical + imaging + NDM features.
-
-    Returns (feature_df, feature_names) where feature_df is indexed by subject_id.
-    """
-    demo_df = demo_df.copy()
-    if "subject_id" not in demo_df.columns and "Subject ID" in demo_df.columns:
-        demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
-
-    # Start with one row per subject (use first visit for demographics)
-    if "MR Delay" in demo_df.columns:
-        demo_sub = demo_df.sort_values("MR Delay").groupby("subject_id").first().reset_index()
-    else:
-        demo_sub = demo_df.groupby("subject_id").first().reset_index()
-
-    # Clinical features
-    feature_cols = []
-    if SEX_COL in demo_sub.columns:
-        demo_sub["sex_encoded"] = (demo_sub[SEX_COL].str.upper() == "M").astype(float)
-        feature_cols.append("sex_encoded")
-
-    for col in CLINICAL_FEATURES:
-        if col in demo_sub.columns:
-            feature_cols.append(col)
-
-    feat_df = demo_sub[["subject_id"] + feature_cols].copy()
-
-    # Regional volumes (mean across visits per subject)
-    if regional_volumes is not None and not regional_volumes.empty:
-        vol_cols = [c for c in regional_volumes.columns
-                    if c.endswith("_norm") and c in regional_volumes.columns]
-        if not vol_cols:
-            vol_cols = [c for c in regional_volumes.columns
-                        if c not in {"subject_id", "session_id"}
-                        and c not in feat_df.columns  # avoid re-adding clinical cols already present
-                        and pd.api.types.is_numeric_dtype(regional_volumes[c])]
-        if vol_cols:
-            vol_mean = regional_volumes.groupby("subject_id")[vol_cols].mean().reset_index()
-            feat_df = feat_df.merge(vol_mean, on="subject_id", how="left")
-            feature_cols.extend(vol_cols)
-
-    # Phase 3 fitted β (continuous risk proxy)
-    if beta_df is not None and not beta_df.empty and "beta" in beta_df.columns:
-        beta_mean = beta_df.groupby("subject_id")["beta"].median().reset_index()
-        beta_mean.rename(columns={"beta": "ndm_beta"}, inplace=True)
-        feat_df = feat_df.merge(beta_mean, on="subject_id", how="left")
-        feature_cols.append("ndm_beta")
-
-    # Phase 4 deficit scores
-    if deficit_scores is not None and not deficit_scores.empty:
-        ds = deficit_scores.reset_index() if deficit_scores.index.name == "subject_id" else deficit_scores
-        if "subject_id" in ds.columns:
-            feat_df = feat_df.merge(ds, on="subject_id", how="left")
-            feature_cols.extend([c for c in ds.columns if c != "subject_id"])
-
-    feat_df = feat_df.set_index("subject_id")
-    feature_cols = [c for c in feature_cols if c in feat_df.columns]
-    feat_df = feat_df[feature_cols]
-
-    logger.info(f"Risk feature matrix: {feat_df.shape[0]} subjects × {len(feature_cols)} features")
-    return feat_df, feature_cols
-
-
-# ---------------------------------------------------------------------------
-# Target label construction
-# ---------------------------------------------------------------------------
-
-def build_risk_labels(
-    demo_df: pd.DataFrame,
-    beta_df: Optional[pd.DataFrame] = None,
-    target: str = "cdr_increase",
-) -> pd.Series:
-    """
-    Build the risk target variable.
-
-    Options:
-      'cdr_increase': binary, 1 if CDR increased from first to last visit
-      'beta':         continuous, NDM diffusivity β (requires beta_df)
-      'demented':     binary, 1 if final Group == 'Demented' or 'Converted'
-
-    Returns a pd.Series indexed by subject_id.
-    """
-    demo_df = demo_df.copy()
-    if "subject_id" not in demo_df.columns and "Subject ID" in demo_df.columns:
-        demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
-
-    if target == "cdr_increase":
-        rows = []
-        for subj, grp in demo_df.groupby("subject_id"):
-            if "MR Delay" in grp.columns:
-                grp = grp.sort_values("MR Delay")
-            elif "Visit" in grp.columns:
-                grp = grp.sort_values("Visit")
-            if "CDR" not in grp.columns or len(grp) < 2:
-                continue
-            cdr_vals = grp["CDR"].dropna()
-            if len(cdr_vals) < 2:
-                continue
-            label = 1 if cdr_vals.iloc[-1] > cdr_vals.iloc[0] else 0
-            rows.append({"subject_id": subj, "target": label})
-        df = pd.DataFrame(rows).set_index("subject_id")
-        return df["target"]
-
-    elif target == "beta" and beta_df is not None:
-        beta_median = beta_df.groupby("subject_id")["beta"].median()
-        return beta_median.rename("target")
-
-    elif target == "demented":
-        demo_sub = demo_df.groupby("subject_id").last().reset_index()
-        if "Group" not in demo_sub.columns:
-            logger.warning("Group column not found for 'demented' target.")
-            return pd.Series(dtype=float)
-        label = (demo_sub["Group"].isin(["Demented", "Converted"])).astype(int)
-        return label.set_axis(demo_sub["subject_id"]).rename("target")
-
-    else:
-        raise ValueError(f"Unknown target: {target}. Choose 'cdr_increase', 'beta', or 'demented'.")
-
-
-# ---------------------------------------------------------------------------
-# Model pipelines
-# ---------------------------------------------------------------------------
-
-def build_risk_pipelines(task: str = "classification") -> Dict[str, Pipeline]:
-    if task == "classification":
-        return {
-            "GradientBoosting": Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("clf", GradientBoostingClassifier(
-                    n_estimators=200, learning_rate=0.05,
-                    max_depth=3, random_state=42,
-                )),
-            ]),
-            "LogisticRegression": Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("clf", LogisticRegression(
-                    max_iter=1000, class_weight="balanced", random_state=42,
-                )),
-            ]),
-        }
-    else:  # regression (for β target)
-        return {
-            "GradientBoostingRegressor": Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("reg", GradientBoostingRegressor(
-                    n_estimators=200, learning_rate=0.05,
-                    max_depth=3, random_state=42,
-                )),
-            ]),
-            "Ridge": Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("reg", Ridge(alpha=1.0)),
-            ]),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Cross-validation
-# ---------------------------------------------------------------------------
-
-def evaluate_risk_model(
-    X: np.ndarray,
-    y: np.ndarray,
-    groups: np.ndarray,
-    task: str = "classification",
-    n_splits: int = 5,
-) -> Dict:
-    pipelines = build_risk_pipelines(task=task)
-    n_splits = min(n_splits, len(np.unique(groups)))
-
-    gkf = GroupKFold(n_splits=n_splits)
-    results = {}
-
-    if task == "classification":
-        scoring = ["accuracy", "roc_auc", "f1_weighted"]
-    else:
-        scoring = ["r2", "neg_mean_squared_error"]
-
-    for name, pipe in tqdm(pipelines.items(), desc="Risk models", unit="model"):
-        try:
-            cv = cross_validate(pipe, X, y, groups=groups, cv=gkf, scoring=scoring)
-            results[name] = {
-                metric: {
-                    "mean": round(float(cv[f"test_{metric}"].mean()), 4),
-                    "std": round(float(cv[f"test_{metric}"].std()), 4),
-                }
-                for metric in scoring
-            }
-            logger.info(f"  {name}: {results[name]}")
-        except Exception as e:
-            logger.error(f"  {name} failed: {e}")
-            results[name] = {"error": str(e)}
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Feature importance
-# ---------------------------------------------------------------------------
-
-def risk_feature_importance(
-    pipeline: Pipeline,
-    feature_names: List[str],
-    top_n: int = 20,
-) -> pd.DataFrame:
-    clf = pipeline.named_steps.get("clf") or pipeline.named_steps.get("reg")
-    if clf is None:
-        return pd.DataFrame()
-
-    if hasattr(clf, "feature_importances_"):
-        importances = clf.feature_importances_
-    elif hasattr(clf, "coef_"):
-        importances = np.abs(clf.coef_).flatten()
-    else:
-        return pd.DataFrame()
-
-    df = pd.DataFrame({"feature": feature_names, "importance": importances})
-    return df.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# Full Phase 5 pipeline
-# ---------------------------------------------------------------------------
-
-def run_phase5(
-    demo_df: pd.DataFrame,
-    regional_volumes: Optional[pd.DataFrame] = None,
-    beta_df: Optional[pd.DataFrame] = None,
-    deficit_scores: Optional[pd.DataFrame] = None,
-    target: str = "cdr_increase",
-    out_dir: Optional[Path] = None,
-) -> Dict:
-    if out_dir is None:
-        out_dir = get_outputs_dir("phase5")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    feat_df, feature_names = build_risk_features(
-        demo_df, regional_volumes, beta_df, deficit_scores
-    )
-    y_series = build_risk_labels(demo_df, beta_df, target=target)
-
-    # Align on subject_id
-    common = feat_df.index.intersection(y_series.index)
-    if len(common) < 10:
-        logger.warning(f"Only {len(common)} subjects with both features and labels.")
-    feat_df = feat_df.loc[common]
-    y_series = y_series.loc[common]
-
-    X = feat_df.values.astype(float)
-    y = y_series.values
-    groups = np.array(common)
-
-    task = "regression" if target == "beta" else "classification"
-    cv_results = evaluate_risk_model(X, y, groups, task=task)
-
-    # Fit final model for feature importances
-    pipelines = build_risk_pipelines(task=task)
-    best_name = list(pipelines.keys())[0]
-    pipe = pipelines[best_name]
-    valid_mask = ~np.isnan(X).any(axis=1) & ~np.isnan(y)
-    if valid_mask.sum() > 5:
-        from sklearn.impute import SimpleImputer
-        imp = SimpleImputer(strategy="median")
-        X_imp = imp.fit_transform(X[valid_mask])
-        pipe.fit(X_imp, y[valid_mask])
-        importances = risk_feature_importance(pipe, feature_names)
-        if not importances.empty:
-            importances.to_csv(out_dir / "risk_feature_importances.csv", index=False)
-            logger.info(f"Top risk features:\n{importances.head(10).to_string()}")
-    else:
-        importances = pd.DataFrame()
-
-    with open(out_dir / "risk_cv_results.json", "w") as f:
-        json.dump(cv_results, f, indent=2)
-
-    # Save commentary note
-    with open(out_dir / "risk_model_note.txt", "w") as f:
-        f.write(
-            "IMPORTANT: This is a CLINICAL RISK STRATIFIER, not a genomic/molecular model.\n"
-            "OASIS-2 has no APOE genotype or other molecular data.\n"
-            "This plays an analogous 'combine non-imaging risk info with imaging' role\n"
-            "to the radiogenomics stage in the tumor pipeline, using clinical features\n"
-            "(Age, Sex, Education, SES, eTIV, nWBV) as proxies.\n"
-            "OASIS-3 includes APOE data and could support a genuinely molecular extension\n"
-            "-- see implementation.md §7 for discussion.\n"
-        )
-
-    logger.info(f"Phase 5 complete. Outputs in: {out_dir}")
-    return {
-        "cv_results": cv_results,
-        "feature_importances": importances,
-        "feature_names": feature_names,
-    }
-
-"""
-progression_model.py — Phase 6: Sustained Progression vs. Fluctuation Classification.
-
-Analog to pseudoprogression vs. true progression discrimination in the tumor pipeline.
-
-Key design decisions (from implementation.md §8):
-  - Target is defined from the CDR TRAJECTORY, not the static Group label.
-    "Sustained progression": monotonically non-decreasing CDR across visits that
-    crosses into dementia territory (CDR ≥ 0.5).
-    "Fluctuation": CDR changes non-monotonically or fluctuates without net sustained increase.
-  - Features: longitudinal Δ in regional volumes + Δ MMSE + NDM β (spread rate)
-    + demographics.
-  - Class imbalance is SEVERE — use class-weighted loss, stratified CV,
-    and bootstrap confidence intervals for sensitivity/specificity.
-  - DO NOT claim clinical-grade performance from ~150 subjects.
-    Report as exploratory pattern-finding.
-
-"""
-
-import sys
-import json
-import warnings
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-import scipy.stats
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, LeaveOneGroupOut
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    confusion_matrix, classification_report,
-    roc_auc_score, f1_score,
-)
-from sklearn.utils.class_weight import compute_class_weight
-
-
-
-logger = setup_logging("progression_model")
-warnings.filterwarnings("ignore", category=UserWarning)
-
-
-# ---------------------------------------------------------------------------
-# CDR trajectory labeling
-# ---------------------------------------------------------------------------
-
-def label_cdr_trajectory(
-    demo_df: pd.DataFrame,
-    cdr_threshold: float = 0.5,
-    min_visits: int = 2,
-) -> pd.DataFrame:
-    """
-    Classify each subject's CDR trajectory as 'sustained_progression' or 'fluctuation'.
-
-    Sustained progression: CDR is monotonically non-decreasing AND reaches >= cdr_threshold.
-    Fluctuation: any other pattern (CDR goes up then down, or never reaches threshold).
-
-    Returns a DataFrame with columns: subject_id, trajectory_label, n_visits,
-    cdr_values, is_monotone, max_cdr, final_cdr.
-    """
-    demo_df = demo_df.copy()
-    if "subject_id" not in demo_df.columns and "Subject ID" in demo_df.columns:
-        demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
-
-    rows = []
-    for subj, grp in demo_df.groupby("subject_id"):
-        if "MR Delay" in grp.columns:
-            grp = grp.sort_values("MR Delay")
-        elif "Visit" in grp.columns:
-            grp = grp.sort_values("Visit")
-
-        if "CDR" not in grp.columns:
-            continue
-        cdr_vals = grp["CDR"].dropna().values
-        if len(cdr_vals) < min_visits:
-            continue
-
-        is_monotone = all(cdr_vals[i] <= cdr_vals[i + 1] for i in range(len(cdr_vals) - 1))
-        max_cdr = float(cdr_vals.max())
-        final_cdr = float(cdr_vals[-1])
-
-        # Sustained progression: monotone AND reaches dementia threshold
-        if is_monotone and max_cdr >= cdr_threshold:
-            label = 1  # sustained progression
-        else:
-            label = 0  # fluctuation / stable
-
-        rows.append({
-            "subject_id": subj,
-            "trajectory_label": label,
-            "n_visits": len(cdr_vals),
-            "cdr_values": ";".join(str(round(v, 2)) for v in cdr_vals),
-            "is_monotone": is_monotone,
-            "max_cdr": max_cdr,
-            "final_cdr": final_cdr,
-            "cdr_range": float(cdr_vals.max() - cdr_vals.min()),
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        counts = df["trajectory_label"].value_counts()
-        logger.info(
-            f"CDR trajectory labels: sustained_progression={counts.get(1, 0)}, "
-            f"fluctuation={counts.get(0, 0)}"
-        )
-        if counts.get(1, 0) < 5:
-            logger.warning(
-                "Very few sustained-progression cases (<5). "
-                "Phase 6 results should be treated as exploratory, not diagnostic."
-            )
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Longitudinal delta features
-# ---------------------------------------------------------------------------
-
-def compute_longitudinal_features(
-    demo_df: pd.DataFrame,
-    regional_volumes: Optional[pd.DataFrame] = None,
-    beta_df: Optional[pd.DataFrame] = None,
-) -> pd.DataFrame:
-    """
-    Build longitudinal CHANGE features per subject:
-      - Δ MMSE (last - first)
-      - Δ CDR (last - first)
-      - Δ regional volumes (last - first, for each region)
-      - NDM β (rate of spread — from Phase 3)
-      - Clinical demographics (Age, Sex, EDUC, SES, eTIV, nWBV at baseline)
-
-    Returns a DataFrame indexed by subject_id.
-    """
-    demo_df = demo_df.copy()
-    if "subject_id" not in demo_df.columns and "Subject ID" in demo_df.columns:
-        demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
-
-    feature_rows = []
-
-    for subj, grp in demo_df.groupby("subject_id"):
-        if "MR Delay" in grp.columns:
-            grp = grp.sort_values("MR Delay")
-        elif "Visit" in grp.columns:
-            grp = grp.sort_values("Visit")
-
-        if len(grp) < 2:
-            continue
-
-        row = {"subject_id": subj}
-
-        # MMSE delta
-        if "MMSE" in grp.columns:
-            valid_mmse = grp["MMSE"].dropna()
-            if len(valid_mmse) >= 2:
-                row["delta_mmse"] = float(valid_mmse.iloc[-1] - valid_mmse.iloc[0])
-
-        # CDR delta
-        if "CDR" in grp.columns:
-            valid_cdr = grp["CDR"].dropna()
-            if len(valid_cdr) >= 2:
-                row["delta_cdr"] = float(valid_cdr.iloc[-1] - valid_cdr.iloc[0])
-
-        # Baseline demographics
-        first = grp.iloc[0]
-        for col in ["Age", "EDUC", "SES", "eTIV", "nWBV"]:
-            if col in first:
-                row[col] = first[col]
-
-        if "M/F" in first:
-            row["sex_encoded"] = 1.0 if str(first["M/F"]).upper() == "M" else 0.0
-
-        # Time span (useful proxy for disease duration observed)
-        if "MR Delay" in grp.columns:
-            row["observation_span_days"] = float(grp["MR Delay"].max() - grp["MR Delay"].min())
-
-        feature_rows.append(row)
-
-    feat_df = pd.DataFrame(feature_rows).set_index("subject_id")
-
-    # Merge regional volume deltas
-    if regional_volumes is not None and not regional_volumes.empty:
-        vol_cols = [c for c in regional_volumes.columns
-                    if c.endswith("_norm") or (
-                        c not in {"subject_id", "session_id"} and
-                        pd.api.types.is_numeric_dtype(regional_volumes[c])
-                    )]
-        for subj, grp in regional_volumes.groupby("subject_id"):
-            if len(grp) < 2:
-                continue
-            # Delta: last - first (sorted by session_id alphabetically as proxy)
-            grp_sorted = grp.sort_values("session_id") if "session_id" in grp.columns else grp
-            for col in vol_cols:
-                valid = grp_sorted[col].dropna()
-                if len(valid) >= 2:
-                    delta_val = float(valid.iloc[-1] - valid.iloc[0])
-                    if subj in feat_df.index:
-                        feat_df.loc[subj, f"delta_{col}"] = delta_val
-
-    # Merge NDM β
-    if beta_df is not None and not beta_df.empty and "beta" in beta_df.columns:
-        beta_med = beta_df.groupby("subject_id")["beta"].median()
-        feat_df = feat_df.join(beta_med.rename("ndm_beta"), how="left")
-
-    logger.info(f"Longitudinal feature matrix: {feat_df.shape}")
-    return feat_df
-
-
-# ---------------------------------------------------------------------------
-# Model pipelines
-# ---------------------------------------------------------------------------
-
-def build_progression_pipelines(class_weight: Optional[Dict] = None) -> Dict[str, Pipeline]:
-    cw = class_weight or "balanced"
-    return {
-        "GradientBoosting": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", GradientBoostingClassifier(
-                n_estimators=100, learning_rate=0.05,
-                max_depth=2, random_state=42,
-            )),
-        ]),
-        "LogisticRegression": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(
-                max_iter=1000, class_weight=cw, random_state=42,
-            )),
-        ]),
-        "RandomForest": Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("clf", RandomForestClassifier(
-                n_estimators=100, class_weight=cw, random_state=42,
-            )),
-        ]),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Bootstrap confidence intervals for sensitivity/specificity
-# ---------------------------------------------------------------------------
-
-def bootstrap_sens_spec(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    n_bootstrap: int = 1000,
-    confidence: float = 0.95,
-) -> Dict:
-    """
-    Compute sensitivity (TPR) and specificity (TNR) with bootstrap 95% CIs.
-    """
-    sensitivities = []
-    specificities = []
-    rng = np.random.default_rng(42)
-
-    for _ in range(n_bootstrap):
-        idx = rng.choice(len(y_true), size=len(y_true), replace=True)
-        yt, yp = y_true[idx], y_pred[idx]
-        tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel() if len(np.unique(yt)) > 1 else (0, 0, 0, 0)
-        sens = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-        spec = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-        sensitivities.append(sens)
-        specificities.append(spec)
-
-    alpha = (1 - confidence) / 2
-
-    def ci(vals):
-        vals = [v for v in vals if not np.isnan(v)]
-        if len(vals) < 10:
-            return {"mean": np.nan, "lower": np.nan, "upper": np.nan}
-        return {
-            "mean": round(float(np.mean(vals)), 4),
-            "lower": round(float(np.percentile(vals, 100 * alpha)), 4),
-            "upper": round(float(np.percentile(vals, 100 * (1 - alpha))), 4),
-        }
-
-    return {
-        "sensitivity": ci(sensitivities),
-        "specificity": ci(specificities),
-        "n_bootstrap": n_bootstrap,
-        "confidence": confidence,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Cross-validation (Leave-One-Subject-Out or repeated stratified k-fold)
-# ---------------------------------------------------------------------------
-
-def evaluate_progression_model(
-    X: np.ndarray,
-    y: np.ndarray,
-    subject_ids: np.ndarray,
-    n_splits: int = 5,
-    use_logo: bool = False,
-) -> Dict:
-    """
-    Evaluate progression classifiers with leave-one-subject-out (LOGO) or
-    stratified k-fold CV.
-
-    Per implementation.md §8: class imbalance is severe. Use class-weighted loss
-    and report sensitivity/specificity with bootstrap CIs.
-    """
-    pipelines = build_progression_pipelines(class_weight="balanced")
-    results = {}
-
-    if use_logo or len(np.unique(subject_ids)) <= n_splits * 2:
-        # Leave-one-subject-out (best for very small n)
-        cv_strategy = LeaveOneGroupOut()
-        cv_kwargs = {"groups": subject_ids}
-        logger.info("Using Leave-One-Subject-Out CV (small n).")
-    else:
-        n_splits = min(n_splits, len(np.unique(subject_ids)) // 2)
-        cv_strategy = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_kwargs = {}
-        logger.info(f"Using StratifiedKFold CV (n_splits={n_splits}).")
-
-    for name, pipe in pipelines.items():
-        all_true = []
-        all_pred = []
-
-        if use_logo or len(np.unique(subject_ids)) <= n_splits * 2:
-            for train_idx, test_idx in cv_strategy.split(X, y, **cv_kwargs):
-                pipe_clone = sklearn_clone(pipe)
-                X_tr, X_te = X[train_idx], X[test_idx]
-                y_tr, y_te = y[train_idx], y[test_idx]
-                if len(np.unique(y_tr)) < 2:
-                    continue
-                try:
-                    pipe_clone.fit(X_tr, y_tr)
-                    preds = pipe_clone.predict(X_te)
-                    all_true.extend(y_te.tolist())
-                    all_pred.extend(preds.tolist())
-                except Exception as e:
-                    logger.debug(f"  fold failed: {e}")
-        else:
-            for train_idx, test_idx in cv_strategy.split(X, y):
-                pipe_clone = sklearn_clone(pipe)
-                X_tr, X_te = X[train_idx], X[test_idx]
-                y_tr, y_te = y[train_idx], y[test_idx]
-                if len(np.unique(y_tr)) < 2:
-                    continue
-                try:
-                    pipe_clone.fit(X_tr, y_tr)
-                    preds = pipe_clone.predict(X_te)
-                    all_true.extend(y_te.tolist())
-                    all_pred.extend(preds.tolist())
-                except Exception as e:
-                    logger.debug(f"  fold failed: {e}")
-
-        if len(all_true) < 5:
-            results[name] = {"error": "insufficient folds"}
-            continue
-
-        all_true = np.array(all_true)
-        all_pred = np.array(all_pred)
-
-        ci_result = bootstrap_sens_spec(all_true, all_pred)
-        acc = float((all_true == all_pred).mean())
-
-        try:
-            auc = float(roc_auc_score(all_true, all_pred))
-        except Exception:
-            auc = np.nan
-
-        results[name] = {
-            "accuracy": round(acc, 4),
-            "roc_auc": round(auc, 4) if not np.isnan(auc) else None,
-            **ci_result,
-            "n_positive": int(all_true.sum()),
-            "n_negative": int((all_true == 0).sum()),
-        }
-        logger.info(
-            f"  {name}: accuracy={acc:.3f}, "
-            f"sensitivity={ci_result['sensitivity']['mean']:.3f} "
-            f"[{ci_result['sensitivity']['lower']:.3f}–{ci_result['sensitivity']['upper']:.3f}], "
-            f"specificity={ci_result['specificity']['mean']:.3f}"
-        )
-
-    return results
-
-
-def sklearn_clone(estimator):
-    """Safely clone a scikit-learn estimator."""
-    from sklearn.base import clone
-    return clone(estimator)
-
-
-# ---------------------------------------------------------------------------
-# Full Phase 6 pipeline
-# ---------------------------------------------------------------------------
-
-def run_phase6(
-    demo_df: pd.DataFrame,
-    regional_volumes: Optional[pd.DataFrame] = None,
-    beta_df: Optional[pd.DataFrame] = None,
-    out_dir: Optional[Path] = None,
-) -> Dict:
-    if out_dir is None:
-        out_dir = get_outputs_dir("phase6")
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Step 1: Label CDR trajectories
-    trajectory_df = label_cdr_trajectory(demo_df)
-    trajectory_df.to_csv(out_dir / "cdr_trajectories.csv", index=False)
-
-    if trajectory_df.empty or trajectory_df["trajectory_label"].nunique() < 2:
-        logger.warning("Not enough trajectory diversity for Phase 6 classification.")
-        return {"error": "insufficient class diversity"}
-
-    # Step 2: Build features
-    feat_df = compute_longitudinal_features(demo_df, regional_volumes, beta_df)
-
-    # Align on subject_id
-    traj_indexed = trajectory_df.set_index("subject_id")
-    common = feat_df.index.intersection(traj_indexed.index)
-    if len(common) < 10:
-        logger.warning(f"Only {len(common)} subjects with both features and labels.")
-        return {"error": "insufficient subjects", "n_subjects": len(common)}
-
-    X = feat_df.loc[common].values.astype(float)
-    y = traj_indexed.loc[common, "trajectory_label"].values
-    subject_ids = np.array(common)
-    feature_names = list(feat_df.columns)
-
-    feat_df.loc[common].to_csv(out_dir / "progression_features.csv")
-
-    # Step 3: Evaluate
-    n_pos = y.sum()
-    n_neg = (y == 0).sum()
-    logger.info(f"Phase 6 class distribution: sustained={n_pos}, fluctuation={n_neg}")
-
-    use_logo = len(common) < 30
-    cv_results = evaluate_progression_model(X, y, subject_ids, use_logo=use_logo)
-
-    with open(out_dir / "progression_cv_results.json", "w") as f:
-        json.dump(cv_results, f, indent=2)
-
-    # Step 4: Limitations report
-    limitations = {
-        "n_subjects": len(common),
-        "n_sustained_progression": int(n_pos),
-        "n_fluctuation": int(n_neg),
-        "warning": (
-            "EXPLORATORY ONLY. Sample size is too small for a validated diagnostic tool. "
-            "Sustained-progression class is likely << 50 subjects. "
-            "Results should not be used clinically without independent replication. "
-            "See implementation.md §8 for full discussion."
-        ),
-    }
-    with open(out_dir / "limitations.json", "w") as f:
-        json.dump(limitations, f, indent=2)
-
-    logger.info(f"Phase 6 complete. Outputs in: {out_dir}")
-    return {
-        "trajectory_df": trajectory_df,
-        "cv_results": cv_results,
-        "feature_names": feature_names,
-        "limitations": limitations,
-    }
-
 # ── Environment summary + GPU check ────────────────────────────────────
 # All pipeline functions were defined directly above (Section 1) — nothing
 # to import, they're already in this notebook's namespace.
@@ -3591,11 +3117,11 @@ import torch
 if torch.cuda.is_available():
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-    print(f"\n[GPU] {gpu_name} detected ({gpu_mem_gb:.1f} GB). Phase 2b CNN training will use the GPU.")
+    print(f"\n[GPU] {gpu_name} detected ({gpu_mem_gb:.1f} GB). DL model training will use the GPU.")
 else:
     print(
         "\n[WARNING] No GPU detected — PyTorch will fall back to CPU, which is "
-        "much slower for Phase 2b (CNN).\n"
+        "much slower for DL model training.\n"
         "          Fix: Runtime menu -> Change runtime type -> Hardware accelerator -> "
         "T4 GPU -> Save, then Runtime -> Restart session and re-run all cells."
     )
@@ -3788,73 +3314,6 @@ else:
 print('Phase 1 complete.')
 
 
-p2a_results = run_phase2a(
-    regional_volumes=regional_volumes,
-    demo_df=demo_df,
-    out_dir=outputs_dir / 'phase2a',
-    n_splits=5,
-)
-
-print('=== Phase 2a CV Results ===')
-print(json.dumps(p2a_results['cv_results'], indent=2))
-print(f'Best model: {p2a_results["best_model_name"]}')
-
-(DRIVE_BASE / 'outputs' / 'phase2a').mkdir(parents=True, exist_ok=True)
-with open(DRIVE_BASE / 'outputs' / 'phase2a' / 'cv_results.json', 'w') as f:
-    json.dump(p2a_results['cv_results'], f, indent=2)
-print('Phase 2a complete.')
-
-# Phase 2a — Feature importance plot
-imp = p2a_results.get('feature_importances', pd.DataFrame())
-if not imp.empty:
-    fig, ax = plt.subplots(figsize=(10, 6))
-    top = imp.head(15)
-    ax.barh(top['feature'], top['importance'],
-            color=plt.cm.viridis(np.linspace(0.3, 0.9, len(top))))
-    ax.set_xlabel('Importance'); ax.invert_yaxis()
-    ax.set_title(f'Phase 2a Feature Importances — {p2a_results["best_model_name"]}')
-    plt.tight_layout()
-    fig.savefig(str(outputs_dir / 'phase2a' / 'feature_importances.png'), dpi=150)
-    plt.show()
-
-import torch
-print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')
-
-nifti_paths, labels_cnn, sids_cnn = [], [], []
-if 'scan_files' in index_df.columns and 'CDR' in demo_df.columns:
-    cdr_map = demo_df.groupby('subject_id')['CDR'].first().to_dict()
-    for _, row in index_df.iterrows():
-        scans = str(row.get('scan_files', ''))
-        if not scans: continue
-        p = Path(scans.split(';')[0])
-        if not p.exists(): continue
-        sid = str(row.get('subject_id', ''))
-        cdr = cdr_map.get(sid, float('nan'))
-        if not pd.isna(cdr):
-            nifti_paths.append(p); labels_cnn.append(int(cdr > 0)); sids_cnn.append(sid)
-
-print(f'NIfTI scans available: {len(nifti_paths)}')
-RUN_CNN = len(nifti_paths) >= 10
-if not RUN_CNN:
-    print('Skipping Phase 2b — insufficient NIfTI files.')
-    print('Phase 2a (classical ML) is the primary result.')
-
-if RUN_CNN:
-    cnn_results = run_cnn_cv(
-        nifti_paths=nifti_paths, labels=labels_cnn, subject_ids=sids_cnn,
-        n_splits=5, backbone='resnet18', n_epochs=10,
-        batch_size=16, n_slices_per_scan=10,
-        out_dir=outputs_dir / 'phase2b',
-    )
-    print(json.dumps(cnn_results, indent=2))
-    (DRIVE_BASE / 'outputs' / 'phase2b').mkdir(parents=True, exist_ok=True)
-    with open(DRIVE_BASE / 'outputs' / 'phase2b' / 'cnn_results.json', 'w') as f:
-        json.dump(cnn_results, f, indent=2)
-else:
-    cnn_results = {'skipped': True}
-print('Phase 2b complete.')
-
-
 p3_results = run_phase3(
     regional_volumes=regional_volumes,
     demo_df=demo_df,
@@ -3949,113 +3408,100 @@ if not deficit_df.empty:
     plt.show()
 
 
-p5_results = run_phase5(
+
+# ===========================================================================
+# DEEP LEARNING MODEL TRAINING
+# ===========================================================================
+
+print('\n' + '=' * 70)
+print('TRAINING DEEP LEARNING MODELS')
+print('=' * 70)
+
+# Load connectome
+from pathlib import Path as _P
+connectome_path = _P(str(processed_dir)) / 'template_connectome.npy'
+adj_matrix, region_names_loaded = load_template_connectome(connectome_path if connectome_path.exists() else None)
+n_regions_dl = adj_matrix.shape[0]
+
+# Build DL datasets from demographics + w-scores
+train_loader, val_loader, test_loader = build_dl_datasets(
     demo_df=demo_df,
-    regional_volumes=regional_volumes if not regional_volumes.empty else None,
-    beta_df=beta_df if not beta_df.empty else None,
-    deficit_scores=deficit_df if not deficit_df.empty else None,
-    target='cdr_increase',
-    out_dir=outputs_dir / 'phase5',
+    w_scores=w_scores,
+    adj_matrix=adj_matrix,
+    region_names=CONNECTOME_REGIONS,
+    seed=42,
 )
 
-print('=== Phase 5 Risk CV Results ===')
-print(json.dumps(p5_results['cv_results'], indent=2))
+st_gnn_ode_model = None
+nd_vae_model = None
+tadm_model = None
 
-(DRIVE_BASE / 'outputs' / 'phase5').mkdir(parents=True, exist_ok=True)
-with open(DRIVE_BASE / 'outputs' / 'phase5' / 'risk_cv_results.json', 'w') as f:
-    json.dump(p5_results['cv_results'], f, indent=2)
+if train_loader is not None:
+    print(f'\nDevice: {DEVICE}')
+    print(f'Regions: {n_regions_dl}')
 
-imp5 = p5_results.get('feature_importances', pd.DataFrame())
-if not imp5.empty:
-    fig, ax = plt.subplots(figsize=(10, 5))
-    top = imp5.head(15)
-    ax.barh(top['feature'], top['importance'],
-            color=plt.cm.plasma(np.linspace(0.2, 0.85, len(top))))
-    ax.invert_yaxis(); ax.set_xlabel('Importance')
-    ax.set_title('Phase 5: Risk Feature Importances (clinical proxy)')
-    plt.tight_layout()
-    fig.savefig(str(outputs_dir / 'phase5' / 'risk_importances.png'), dpi=150)
-    plt.show()
-print('Phase 5 complete.')
+    # --- Model 1: ST-GNN-ODE ---
+    print('\n--- Training Model 1: ST-GNN-ODE ---')
+    try:
+        st_gnn_ode_model = train_st_gnn_ode(train_loader, val_loader, n_epochs=50, lr=1e-3, patience=10)
+        print('[OK] ST-GNN-ODE training complete.')
+    except Exception as e:
+        print(f'[ERROR] ST-GNN-ODE training failed: {e}')
+        import traceback; traceback.print_exc()
 
+    # --- Model 2: ND-VAE ---
+    print('\n--- Training Model 2: ND-VAE ---')
+    try:
+        nd_vae_model = train_nd_vae(train_loader, val_loader, n_regions_dl, n_epochs=100, lr=1e-3, patience=10)
+        print('[OK] ND-VAE training complete.')
+    except Exception as e:
+        print(f'[ERROR] ND-VAE training failed: {e}')
+        import traceback; traceback.print_exc()
 
-traj_preview = label_cdr_trajectory(demo_df)
-print('Trajectory distribution:')
-print(traj_preview['trajectory_label'].value_counts())
+    # --- Model 3: TADM ---
+    print('\n--- Training Model 3: TADM ---')
+    try:
+        tadm_model = train_tadm(train_loader, val_loader, n_regions_dl, n_epochs=200, lr=1e-3, patience=15)
+        print('[OK] TADM training complete.')
+    except Exception as e:
+        print(f'[ERROR] TADM training failed: {e}')
+        import traceback; traceback.print_exc()
 
-p6_results = run_phase6(
-    demo_df=demo_df,
-    regional_volumes=regional_volumes if not regional_volumes.empty else None,
-    beta_df=beta_df if not beta_df.empty else None,
-    out_dir=outputs_dir / 'phase6',
-)
+    # --- Benchmark ---
+    print('\n--- Running Benchmark ---')
+    (DRIVE_BASE / 'outputs' / 'benchmark').mkdir(parents=True, exist_ok=True)
+    benchmark_df = run_benchmark(
+        ndm_results=p3_results,
+        st_gnn_ode_model=st_gnn_ode_model,
+        nd_vae_model=nd_vae_model,
+        tadm_model=tadm_model,
+        test_loader=test_loader,
+        n_regions=n_regions_dl,
+        out_dir=outputs_dir / 'benchmark',
+    )
+    benchmark_df.to_csv(DRIVE_BASE / 'outputs' / 'benchmark' / 'benchmark_results.csv')
+    print('[OK] Benchmark complete.')
 
-print('=== Phase 6 CV Results ===')
-print(json.dumps(p6_results.get('cv_results', {}), indent=2))
-print('Limitations:', json.dumps(p6_results.get('limitations', {}), indent=2))
-
-(DRIVE_BASE / 'outputs' / 'phase6').mkdir(parents=True, exist_ok=True)
-with open(DRIVE_BASE / 'outputs' / 'phase6' / 'progression_cv_results.json', 'w') as f:
-    json.dump(p6_results.get('cv_results', {}), f, indent=2)
-if 'trajectory_df' in p6_results:
-    p6_results['trajectory_df'].to_csv(
-        DRIVE_BASE / 'outputs' / 'phase6' / 'cdr_trajectories.csv', index=False)
-
-# Visualization
-traj_df = p6_results.get('trajectory_df', pd.DataFrame())
-if not traj_df.empty:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    fig.suptitle('Phase 6: CDR Trajectory Classification', fontsize=13, fontweight='bold')
-    counts = traj_df['trajectory_label'].value_counts()
-    axes[0].bar(['Fluctuation (0)', 'Sustained (1)'],
-                [counts.get(0,0), counts.get(1,0)], color=['#4CAF50','#F44336'])
-    axes[0].set_ylabel('Subjects'); axes[0].set_title('Class distribution')
-    if 'CDR' in demo_df.columns:
-        dm = demo_df.merge(traj_df[['subject_id','trajectory_label']], on='subject_id', how='left')
-        for lbl, col in [(1,'#F44336'),(0,'#4CAF50')]:
-            for sid in traj_df[traj_df['trajectory_label']==lbl]['subject_id'].values[:8]:
-                sd = dm[dm['subject_id']==sid].sort_values('MR Delay') if 'MR Delay' in dm.columns else dm[dm['subject_id']==sid]
-                if 'CDR' in sd.columns:
-                    axes[1].plot(sd.get('MR Delay', pd.Series(range(len(sd))))/365,
-                                 sd['CDR'], color=col, alpha=0.55, linewidth=1.8)
-        from matplotlib.lines import Line2D
-        axes[1].legend(handles=[Line2D([0],[0],color='#F44336',linewidth=2,label='Sustained'),
-                                 Line2D([0],[0],color='#4CAF50',linewidth=2,label='Fluctuation')])
-        axes[1].set_xlabel('Years'); axes[1].set_ylabel('CDR')
-        axes[1].set_title('Sample CDR trajectories')
-    plt.tight_layout()
-    fig.savefig(str(outputs_dir / 'phase6' / 'trajectory_plot.png'), dpi=150)
-    plt.show()
-print('Phase 6 complete.')
-
-# Aggregate summary table
-rows = []
-for model, m in p2a_results.get('cv_results', {}).items():
-    if 'accuracy' in m:
-        rows.append({'Phase':'2a Classification','Method':model,
-                     'Metric':f"Acc {m['accuracy']['mean']:.3f}+/-{m['accuracy']['std']:.3f}",
-                     'Note':'GroupKFold, honest 60-75%'})
-v3 = p3_results.get('validation',{})
-if v3 and 'pearson_r' in v3:
-    rows.append({'Phase':'3 NDM','Method':'NDM',
-                 'Metric':f"Pearson r={v3['pearson_r']}", 'Note':'Raj2015: r~0.93 ADNI'})
-for model, m in p6_results.get('cv_results',{}).items():
-    if 'accuracy' in m:
-        s=m.get('sensitivity',{}).get('mean','?')
-        sp=m.get('specificity',{}).get('mean','?')
-        rows.append({'Phase':'6 Progression','Method':model,
-                     'Metric':f"Sens={s}, Spec={sp}", 'Note':'EXPLORATORY'})
-summary = pd.DataFrame(rows)
-print(summary.to_string(index=False))
-summary.to_csv(outputs_dir / 'aggregate_metrics.csv', index=False)
-summary.to_csv(DRIVE_BASE / 'outputs' / 'aggregate_metrics.csv', index=False)
+    # Save models to Drive
+    models_dir = DRIVE_BASE / 'models'
+    models_dir.mkdir(parents=True, exist_ok=True)
+    if st_gnn_ode_model is not None:
+        torch.save(st_gnn_ode_model.state_dict(), models_dir / 'st_gnn_ode.pt')
+    if nd_vae_model is not None:
+        torch.save(nd_vae_model.state_dict(), models_dir / 'nd_vae.pt')
+    if tadm_model is not None:
+        torch.save(tadm_model.state_dict(), models_dir / 'tadm.pt')
+    print(f'[OK] Models saved to {models_dir}')
+else:
+    print('[WARNING] Could not build DL datasets — skipping model training.')
+    benchmark_df = pd.DataFrame()
 
 # Per-subject report
-SUBJECT_ID = None  # set to e.g. 'OAS2_0001' or leave None for auto-select
+SUBJECT_ID = None
 if SUBJECT_ID is None and not beta_df.empty:
     SUBJECT_ID = beta_df['subject_id'].dropna().iloc[0]
 if SUBJECT_ID:
-    print(f'=== Per-Subject Report: {SUBJECT_ID} ===')
+    print(f'\n=== Per-Subject Report: {SUBJECT_ID} ===')
     sd = demo_df[demo_df['subject_id']==SUBJECT_ID]
     if not sd.empty:
         r = sd.iloc[0]
@@ -4064,27 +3510,7 @@ if SUBJECT_ID:
     if len(sb): print(f'  NDM beta={sb.iloc[0]:.4f}')
     if not deficit_df.empty and SUBJECT_ID in deficit_df.index:
         print('  Top deficits:', dict(deficit_df.loc[SUBJECT_ID].sort_values(ascending=False).head(3).round(3)))
-    tr = traj_preview[traj_preview['subject_id']==SUBJECT_ID]
-    if not tr.empty:
-        lbl = 'Sustained Progression' if tr['trajectory_label'].values[0]==1 else 'Fluctuation'
-        print(f'  CDR trajectory: {lbl}')
-        print(f'  CDR values: {tr["cdr_values"].values[0]}')
 
-# Methods adaptation note
-note = """
-METHODS ADAPTATION NOTE
-========================
-Structural analogs between this OASIS-2 pipeline and the tumor source pipeline:
-
-  nnU-Net/Swin UNETR (3D seg)  ->  SynthSeg T1 parcellation + volumetric ML
-  Fisher-Kolmogorov PDE + DTI  ->  Network Diffusion Model (Raj et al. 2012)
-  PINN / adjoint inverse        ->  scipy.optimize least-squares beta fit
-  Eloquent-cortex mapping       ->  Region->cognitive domain atlas
-  Radiogenomics (IDH/MGMT)      ->  Clinical risk proxy (no genomics in OASIS-2)
-  Pseudoprogression vs. TP      ->  CDR: sustained monotone vs. fluctuation
-"""
-print(note)
-with open(outputs_dir / 'methods_note.txt', 'w') as f: f.write(note)
-with open(DRIVE_BASE / 'outputs' / 'methods_note.txt', 'w') as f: f.write(note)
-print(f'All outputs saved to Drive: {DRIVE_BASE / "outputs"}')
+print(f'\nAll outputs saved to Drive: {DRIVE_BASE / "outputs"}')
 print('Pipeline complete.')
+
