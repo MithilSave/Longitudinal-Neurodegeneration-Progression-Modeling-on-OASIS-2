@@ -13,14 +13,18 @@ The practical unit of analysis on OASIS-2 is **brain regions / tissue compartmen
 
 ---
 
-## 1. Central research question
+## 1. Central research question & Core Project Goal
+
+**The ultimate goal of this project is to directly answer two specific questions for any given subject:**
+1. **What brain regions are currently affected?**
+2. **What brain regions might get affected next?**
 
 Can we construct a personalized, interpretable digital twin from a subject's longitudinal structural MRI (OASIS-2) that can:
 
-1. Locate currently affected/atrophied brain regions ✅
+1. Locate currently affected/atrophied brain regions ✅ *(Answers Goal #1)*
 2. Quantify regional vulnerability relative to the subject's own baseline and to the cohort ✅
 3. Model the direction and rate of structural change across visits ✅
-4. Predict which regions are likely to show significant volume/atrophy change at the next visit ✅
+4. Predict which regions are likely to show significant volume/atrophy change at the next visit ✅ *(Answers Goal #2)*
 5. Estimate a plausible time horizon for that change, conditioned on visit spacing in the data ✅
 6. Explain every prediction in terms of the actual input features (not a black box) ✅
 7. Provide a defined extension interface for cellular/molecular layers once such data exists 🔶
@@ -233,7 +237,7 @@ Rendered in plain language:
 
 | Audience | What they see |
 |---|---|
-| Patient/family (plain-language summary) | "Your memory-related brain regions show a moderate predicted risk of further change. This is a probability, not a certainty." |
+| Patient/family (plain-language summary) | "Currently, Region X is showing atrophy. Based on our models, Region Y might get affected next. This is a probability, not a certainty." |
 | Clinician | Regional risk map, feature contributions, uncertainty interval, projected trajectory, CDR/MMSE context |
 | Researcher | Full co-atrophy propagation graph, region embeddings, model calibration curves, ablation results |
 | ML engineer | Architecture diagram, per-fold metrics, feature importances, calibration, confidence intervals |
@@ -388,6 +392,7 @@ The existing pipeline is a cross-sectional CNN classifier (per-slice, per-subjec
 4. A dedicated interpretability layer with audience-specific report rendering (Phase 5, Section 8) — currently the pipeline outputs metrics/predictions but not structured, audience-aware explanations.
 5. A forward-simulation module with uncertainty bands and a clearly-scoped counterfactual sensitivity analysis (Phases 6–7) — entirely new capability.
 6. Explicit, documented interface stubs for the molecular/cellular layers (Levels 3–5) so the system is architecturally ready for ADNI/PET/spatial-transcriptomics integration without a rewrite — new, and directly addresses the ambition of the pasted proposal while staying honest about OASIS-2's actual contents.
+7. **Directly addresses the primary objective:** Explicitly mapping *what is currently affected* and predicting *what might get affected next* on a personalized, region-by-region level.
 
 ---
 
