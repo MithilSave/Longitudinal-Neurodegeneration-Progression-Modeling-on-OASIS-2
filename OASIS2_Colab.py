@@ -2632,6 +2632,12 @@ def validate_ndm(
 
     all_predicted = []
     all_actual = []
+    validated_subjects: set = set()
+
+    # Guard: beta_df may be empty (no columns) when no W-score regions were found
+    if beta_df.empty or "subject_id" not in beta_df.columns:
+        logger.warning("beta_df is empty or missing 'subject_id' — skipping NDM validation.")
+        return {"n_subjects_validated": 0, "pearson_r": float("nan"), "mse": float("nan")}
 
     for subj_id, grp in tqdm(list(merged.groupby("subject_id")), desc="Validating NDM", unit="subj"):
         if len(grp) < 3:
@@ -2657,6 +2663,7 @@ def validate_ndm(
             continue
         all_predicted.extend(x_pred[valid].tolist())
         all_actual.extend(x_actual[valid].tolist())
+        validated_subjects.add(subj_id)
 
     if len(all_predicted) < 5:
         logger.warning("Not enough 3-visit subjects for NDM validation.")
@@ -2666,7 +2673,7 @@ def validate_ndm(
     mse = np.mean((np.array(all_predicted) - np.array(all_actual)) ** 2)
 
     result = {
-        "n_subjects_validated": len(set()),
+        "n_subjects_validated": len(validated_subjects),
         "n_region_observations": len(all_predicted),
         "pearson_r": round(float(r), 4),
         "p_value": round(float(p), 6),
@@ -2724,6 +2731,23 @@ def run_phase3(
     w_scores = compute_w_scores(regional_volumes, demo_df)
     w_scores.to_csv(out_dir / "w_scores.csv", index=False)
     logger.info(f"W-scores computed: {w_scores.shape}")
+
+    # Guard: if no _wscore columns were produced (empty regional_volumes), skip gracefully
+    wscore_cols = [c for c in w_scores.columns if c.endswith("_wscore")]
+    if not wscore_cols:
+        logger.warning(
+            "No W-score columns in w_scores — regional_volumes has no region data. "
+            "Phase 3 NDM cannot run. Returning empty results. "
+            "Run Phase 1 (SynthSeg / FSL segmentation) first to generate regional volumes."
+        )
+        return {
+            "eigenvalues": eigenvalues,
+            "eigenvectors": eigenvectors,
+            "region_names": region_names,
+            "w_scores": w_scores,
+            "beta_df": pd.DataFrame(),
+            "validation": {"n_subjects_validated": 0, "pearson_r": float("nan"), "mse": float("nan")},
+        }
 
     # Step 3: Fit β
     beta_df = fit_all_betas(w_scores, eigenvalues, eigenvectors, demo_df)
