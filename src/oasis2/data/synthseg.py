@@ -213,8 +213,40 @@ def aggregate_volumes(
     # Normalise by eTIV if available
     if demo_df is not None and "eTIV" in demo_df.columns:
         demo_df = demo_df.copy()
-        demo_df["subject_id"] = demo_df.get("Subject ID", demo_df.get("subject_id", "")).str.upper()
-        volumes = volumes.merge(demo_df[["subject_id", "eTIV"]], on="subject_id", how="left")
+        demo_df["subject_id"] = demo_df.get("Subject ID", demo_df.get("subject_id", "")).astype(str).str.upper()
+
+        # NOTE (bugfix, Task 13 follow-up): demo_df is one row per (subject,
+        # visit); `volumes` is one row per (subject, session). A
+        # subject_id-only merge produces a row explosion and mis-pairs eTIV
+        # across visits for every multi-visit subject — same class of bug as
+        # `build_subjects_index` in ingest.py and `compute_w_scores` in
+        # ndm.py. Prefer a direct compound (subject_id, session_id) join when
+        # demo_df already carries a matching session_id column; otherwise
+        # fall back to demo_df's "MRI ID" column (format
+        # f"{subject_id}_{session_id}") and build the same compound key on
+        # the volumes side.
+        if "session_id" in demo_df.columns and "session_id" in volumes.columns:
+            join_cols = ["subject_id", "session_id"]
+            volumes = volumes.merge(demo_df[join_cols + ["eTIV"]], on=join_cols, how="left")
+        elif "MRI ID" in demo_df.columns:
+            demo_df["_merge_key"] = demo_df["MRI ID"].astype(str).str.upper().str.strip()
+            volumes = volumes.copy()
+            volumes["_merge_key"] = (
+                volumes["subject_id"].astype(str).str.upper().str.strip()
+                + "_"
+                + volumes["session_id"].astype(str).str.upper().str.strip()
+            )
+            volumes = volumes.merge(demo_df[["_merge_key", "eTIV"]], on="_merge_key", how="left")
+            volumes = volumes.drop(columns=["_merge_key"])
+        else:
+            logger.warning(
+                "demo_df has no 'session_id' or 'MRI ID' column to build a "
+                "per-visit merge key — falling back to a subject_id-only "
+                "merge, which will duplicate rows and mis-pair eTIV for "
+                "multi-visit subjects."
+            )
+            volumes = volumes.merge(demo_df[["subject_id", "eTIV"]], on="subject_id", how="left")
+
         region_cols = [c for c in volumes.columns
                        if c not in {"subject_id", "session_id", "eTIV"}
                        and pd.api.types.is_numeric_dtype(volumes[c])]

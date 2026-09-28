@@ -318,7 +318,38 @@ def build_subjects_index(
     if not scan_df.empty and not demo_df.empty:
         # Normalise subject ID for merge
         demo_df["subject_id"] = demo_df["Subject ID"].str.upper().str.strip()
-        index_df = scan_df.merge(demo_df, on="subject_id", how="left")
+
+        # NOTE (bugfix, Task 13 follow-up): demo_df is OASIS-2's longitudinal
+        # demographics table — one row per (subject, visit) — while scan_df is
+        # one row per (subject, session) discovered on disk. Merging on
+        # subject_id alone produces a full cross-product per subject (a
+        # subject with 2 scan sessions and 2 demographic visits yields 4
+        # merged rows instead of 2) and pairs each scan session with the
+        # wrong visit's demographics roughly half the time. demo_df's
+        # "MRI ID" column already encodes the compound key in the form
+        # f"{subject_id}_{session_id}" (e.g. "OAS2_0001_MR1"), matching
+        # scan_df's subject_id + session_id, so build the same compound key
+        # on both sides and merge on that instead. Same class of bug/fix as
+        # `compute_w_scores` in ndm.py (Task 4).
+        if "MRI ID" in demo_df.columns:
+            demo_df["_merge_key"] = demo_df["MRI ID"].astype(str).str.upper().str.strip()
+            scan_df = scan_df.copy()
+            scan_df["_merge_key"] = (
+                scan_df["subject_id"].astype(str).str.upper().str.strip()
+                + "_"
+                + scan_df["session_id"].astype(str).str.upper().str.strip()
+            )
+            demo_merge_cols = [c for c in demo_df.columns if c != "subject_id"]
+            index_df = scan_df.merge(demo_df[demo_merge_cols], on="_merge_key", how="left")
+            index_df = index_df.drop(columns=["_merge_key"])
+        else:
+            logger.warning(
+                "Demographic CSV has no 'MRI ID' column to build a per-visit "
+                "merge key — falling back to a subject_id-only merge, which "
+                "will duplicate rows and mis-pair visits for multi-visit "
+                "subjects."
+            )
+            index_df = scan_df.merge(demo_df, on="subject_id", how="left")
     elif not scan_df.empty:
         index_df = scan_df
     elif not demo_df.empty:
