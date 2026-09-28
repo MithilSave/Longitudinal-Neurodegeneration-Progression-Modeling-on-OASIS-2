@@ -37,6 +37,7 @@ def plot_phase0_overview(demo_df: pd.DataFrame, outputs_dir: Path) -> Path:
     out_path = outputs_dir / 'phase0_overview.png'
     fig.savefig(str(out_path), dpi=150, bbox_inches='tight')
     plt.close(fig)
+    logger.info(f"Phase 0 overview plot saved to: {out_path}")
     return out_path
 
 
@@ -46,7 +47,11 @@ def plot_phase3_ndm_results(
 ) -> Optional[Path]:
     from oasis2.connectome import ndm_propagate
 
-    if beta_df.empty or 'beta' not in beta_df.columns:
+    if beta_df.empty or 'beta' not in beta_df.columns or beta_df['beta'].dropna().empty:
+        logger.warning(
+            "beta_df is empty, missing 'beta' column, or has no non-NaN beta values "
+            "— skipping Phase 3 plot"
+        )
         return None
     outputs_dir = Path(outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -73,11 +78,13 @@ def plot_phase3_ndm_results(
     out_path = outputs_dir / 'ndm_results.png'
     fig.savefig(str(out_path), dpi=150, bbox_inches='tight')
     plt.close(fig)
+    logger.info(f"Phase 3 NDM plot saved to: {out_path}")
     return out_path
 
 
 def plot_phase4_deficit_profiles(deficit_df: pd.DataFrame, outputs_dir: Path) -> Optional[Path]:
     if deficit_df.empty:
+        logger.warning("deficit_df is empty — skipping Phase 4 plot")
         return None
     outputs_dir = Path(outputs_dir)
     outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -99,4 +106,5 @@ def plot_phase4_deficit_profiles(deficit_df: pd.DataFrame, outputs_dir: Path) ->
     out_path = outputs_dir / 'deficit_profiles.png'
     fig.savefig(str(out_path), dpi=150)
     plt.close(fig)
+    logger.info(f"Phase 4 deficit profiles plot saved to: {out_path}")
     return out_path
