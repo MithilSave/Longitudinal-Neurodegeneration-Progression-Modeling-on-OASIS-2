@@ -70,12 +70,26 @@ class TemplateRenderer:
 
 
 def compute_node_attribution(
-    model: nn.Module, nf, times, cov, adj, mask, target_node_idx: int = 0
-) -> Tuple[np.ndarray, str]:
+    model: nn.Module, nf, times, cov, adj, mask, target_node_idx: int = 0, sample_idx: int = 0
+) -> Tuple[np.ndarray, str, float]:
     """Run Integrated Gradients on `target_node_idx`'s prediction and render a report.
 
-    Returns (attr_sum, report) where attr_sum has shape (N,) — the baseline-visit
-    attribution for every region.
+    `nf` (and the other batch tensors) may hold a full batch of B samples, but
+    Integrated Gradients is only interpreted here for a single patient: the whole
+    batch is run through IG (Captum needs it for its internal step expansion), but
+    only `sample_idx`'s attribution is extracted and returned. This is a deliberate
+    tradeoff of the current approach — computing the full batch is wasted work when
+    only one sample's attribution is needed — not a bug to fix here.
+
+    Returns (attr_sum, report, delta):
+      - attr_sum has shape (N,), the baseline-visit attribution for every region
+        for sample `sample_idx`.
+      - report is a one-line clinician-facing summary string.
+      - delta is Captum's convergence delta for `sample_idx`: how well
+        sum(attributions) approximates f(input) - f(baseline) (the completeness
+        axiom for Integrated Gradients). Values close to 0 indicate the IG
+        approximation (governed by `n_steps`) is trustworthy; large |delta|
+        signals the attribution may be unreliable.
     """
     from captum.attr import IntegratedGradients
 
@@ -84,10 +98,12 @@ def compute_node_attribution(
     ig = IntegratedGradients(single_input)
 
     baseline = torch.zeros_like(nf)
-    attributions, _delta = ig.attribute(nf, baseline, return_convergence_delta=True)
-    attr_sum = attributions[0, 0, :, 0].cpu().detach().numpy()
+    attributions, delta = ig.attribute(nf, baseline, return_convergence_delta=True)
+    attr_sum = attributions[sample_idx, 0, :, 0].cpu().detach().numpy()
+    delta_val = float(delta[sample_idx].cpu().detach().item())
 
     renderer = TemplateRenderer()
     report = renderer.render(attr_sum)
     logger.info(report)
-    return attr_sum, report
+    logger.info("Convergence delta for sample %d: %.6f", sample_idx, delta_val)
+    return attr_sum, report, delta_val
