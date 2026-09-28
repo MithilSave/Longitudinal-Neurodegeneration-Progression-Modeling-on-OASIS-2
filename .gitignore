@@ -17,7 +17,7 @@ data/raw/OAS2_RAW_PART1/
 
 # ===== Outputs & Models (not pushed for now) =====
 outputs/
-models/
+/models/
 
 # ===== OS / IDE =====
 .DS_Store

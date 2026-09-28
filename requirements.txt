@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+scikit-learn
+networkx
+statsmodels
+torch
+nibabel
+nilearn
+SimpleITK
+tqdm
+openpyxl
+matplotlib
+seaborn
+captum
+pytest
