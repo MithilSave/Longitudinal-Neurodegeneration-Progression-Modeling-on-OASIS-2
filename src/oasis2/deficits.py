@@ -4,16 +4,6 @@ Ported from OASIS2_Colab.py (lines 2804-3139): a region -> cognitive-domain
 atlas, deficit-score computation from predicted regional atrophy, and
 validation against real MMSE/CDR outcomes.
 
-NOTE (bugfix): `get_domain_weights` in the source script only accepts a
-required `region_name` argument (single-region lookup). The plan's own test
-for this module (`test_get_domain_weights_returns_nonempty_dict`) calls it
-with no arguments at all and expects a non-empty dict back. To reconcile
-this without changing the single-region lookup behaviour used internally by
-`compute_deficit_scores`, `region_name` is given a default of `None`: calling
-`get_domain_weights()` with no region returns the whole `REGION_DOMAIN_MAP`
-atlas (which is itself a non-empty dict), while `get_domain_weights("...")`
-keeps its original per-region behaviour.
-
 NOTE (bugfix): `run_phase4`'s source implementation returns a bare `{}` when
 no subject has a non-NaN fitted beta (`if not predicted_rows: return {}`).
 With the small synthetic fixtures used in tests (8 regions) run through
@@ -116,14 +106,8 @@ COGNITIVE_DOMAINS = [
 ]
 
 
-def get_domain_weights(region_name: Optional[str] = None) -> Dict:
-    """Return the cognitive domain weights for a brain region.
-
-    If `region_name` is omitted (None), returns the full region -> domain
-    weight atlas (`REGION_DOMAIN_MAP`) instead of a single region's weights.
-    """
-    if region_name is None:
-        return REGION_DOMAIN_MAP
+def get_domain_weights(region_name: str) -> Dict[str, float]:
+    """Return the cognitive domain weights for a brain region."""
     # Try exact match first
     if region_name in REGION_DOMAIN_MAP:
         return REGION_DOMAIN_MAP[region_name]

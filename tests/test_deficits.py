@@ -13,6 +13,11 @@ def test_run_phase4_on_synthetic_ndm_results(tmp_path, monkeypatch, synthetic_re
 
 
 def test_get_domain_weights_returns_nonempty_dict():
-    weights = deficits.get_domain_weights()
+    weights = deficits.get_domain_weights("Left-Hippocampus")
     assert isinstance(weights, dict)
     assert len(weights) > 0
+
+
+def test_region_domain_map_is_nonempty_dict():
+    assert isinstance(deficits.REGION_DOMAIN_MAP, dict)
+    assert len(deficits.REGION_DOMAIN_MAP) > 0
