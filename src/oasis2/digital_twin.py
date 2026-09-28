@@ -19,10 +19,46 @@ from oasis2.logging_utils import setup_logging
 logger = setup_logging("digital_twin")
 
 
+def _deterministic_decode(model: nn.Module, nf: torch.Tensor, times: torch.Tensor, cov: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Decode using the posterior mean (mu) instead of a stochastic reparameterized
+    sample, for a stable point-estimate prediction. Mirrors PhysicsConstrainedNDVAE.forward's
+    per-timestep decode loop but skips reparameterize's random sampling, so calling this
+    twice with identical inputs always returns identical output.
+
+    `PhysicsConstrainedNDVAE.encode`/`decode` don't take an `adj` argument at all — the
+    model's encoder is a GRU over flattened node features and its decoder is an MLP over
+    (z, t, covariates); there is no graph convolution over `adj` in either. `adj` is only
+    consumed by `physics_loss`, which this point-estimate path doesn't invoke, so `adj` is
+    correctly omitted here.
+    """
+    mu, _logvar = model.encode(nf, cov, mask)
+    B, K = times.shape
+    recon_list = []
+    for ki in range(K):
+        x_hat, _m_hat, _c_hat = model.decode(mu, times[:, ki], cov)
+        recon_list.append(x_hat)
+    return torch.stack(recon_list, dim=1)
+
+
 def simulate_rollout(model: nn.Module, nf_init: torch.Tensor, cov: torch.Tensor, adj: torch.Tensor, steps: int = 3) -> torch.Tensor:
     """Autoregressive forward rollout: repeatedly predicts the next visit and
     feeds it back in as input. `nf_init` is (B, 1, N, D) — a single baseline visit.
-    Returns (B, steps, N, D)."""
+    Returns (B, steps, N, D).
+
+    This is a deterministic point-estimate rollout: each step decodes from the
+    posterior mean (mu) rather than a stochastic reparameterized sample, so calling
+    this function twice with identical inputs always returns identical output — a
+    caller building a report or dashboard from `.eval()` inference can rely on that.
+    It intentionally does NOT report uncertainty; `generate_confidence_bands` is the
+    sanctioned way to get the uncertainty band around a point estimate like this one.
+    The two functions have a clear division of labor: `simulate_rollout` produces one
+    stable trajectory, `generate_confidence_bands` produces the uncertainty around a
+    given input.
+
+    `adj` is accepted (and passed through unused) for interface stability: callers
+    already pass it, and a future model swapped in here might need it even though
+    `PhysicsConstrainedNDVAE`'s encode/decode do not use it.
+    """
     model.eval()
     B, _, N, D = nf_init.shape
     current_nf = nf_init.clone()
@@ -37,7 +73,7 @@ def simulate_rollout(model: nn.Module, nf_init: torch.Tensor, cov: torch.Tensor,
             msk_padded = torch.ones((B, K + 1), dtype=torch.bool).to(nf_init.device)
             msk_padded[:, -1] = False
 
-            recon, _, _, _, _ = model(nf_padded, t_padded, cov, adj, msk_padded)
+            recon = _deterministic_decode(model, nf_padded, t_padded, cov, msk_padded)
             next_state = recon[:, -1:, :, :]
             trajectories.append(next_state)
             current_nf = torch.cat([current_nf, next_state], dim=1)
@@ -51,13 +87,14 @@ def generate_confidence_bands(
     """Monte-Carlo sample the VAE's stochastic reparameterization n_samples times
     and return (mean, 5th percentile, 95th percentile) prediction arrays.
 
-    The model must be put into train() mode to re-sample the VAE's latent
-    noise on every forward pass (PhysicsConstrainedNDVAE.reparameterize always
-    samples eps ~ N(0,1), but train() vs eval() affects GRU/dropout behavior
-    the same way it does for any other torch module) — this function always
-    restores the model's original mode before returning, including when
-    sampling raises, so it can't leak train-mode into unrelated code that
-    reuses the same model instance afterward.
+    The model is switched to train() mode as a defensive measure in case the
+    underlying model has dropout/BatchNorm layers whose behavior should vary
+    across MC samples. For the current PhysicsConstrainedNDVAE this has no
+    effect: its only source of stochasticity is reparameterize()'s unconditional
+    `eps ~ N(0,1)` sample, which fires regardless of `self.training`, and the
+    model has no dropout or BatchNorm. The mode is still saved/restored via
+    try/finally, so this function never leaks train-mode into the caller's
+    model instance regardless of whether train() actually changes anything.
     """
     was_training = model.training
     model.train()
@@ -82,18 +119,30 @@ def apply_counterfactual(
 ) -> float:
     """Perturb one covariate (e.g. age, scaled by 100 in the source data — see
     implementation.md) by `delta` and return the average change in predicted
-    regional volumes vs. the unperturbed mean prediction."""
-    mean_pred, _, _ = generate_confidence_bands(model, nf, times, cov, adj, mask, n_samples=10)
+    regional volumes vs. the unperturbed baseline prediction.
 
+    Both the baseline and counterfactual predictions are computed via the same
+    deterministic posterior-mean decode path (`_deterministic_decode`), not via
+    independent stochastic samples. Diffing two independently-sampled stochastic
+    reconstructions (as an earlier version of this function did, comparing a
+    10-sample MC mean from `generate_confidence_bands` against one fresh stochastic
+    sample) buries a real counterfactual effect in sampling noise of comparable
+    magnitude. Routing both sides through the same deterministic decode makes the
+    reparameterization noise cancel out entirely, so `delta=0.0` yields a diff that
+    is (up to floating point) exactly 0, and a real `delta` yields a diff that
+    reflects the actual effect of the covariate perturbation.
+    """
     was_training = model.training
     model.eval()
-    cov_cf = cov.clone()
-    cov_cf[:, covariate_idx] += delta
     try:
         with torch.no_grad():
-            recon_cf, _, _, _, _ = model(nf, times, cov_cf, adj, mask)
+            baseline_pred = _deterministic_decode(model, nf, times, cov, mask)
+
+            cov_cf = cov.clone()
+            cov_cf[:, covariate_idx] += delta
+            recon_cf = _deterministic_decode(model, nf, times, cov_cf, mask)
     finally:
         model.train(was_training)
 
-    diff = (recon_cf.cpu().numpy() - mean_pred).mean()
+    diff = (recon_cf.cpu().numpy() - baseline_pred.cpu().numpy()).mean()
     return float(diff)

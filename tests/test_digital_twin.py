@@ -69,3 +69,47 @@ def test_apply_counterfactual_changes_age_covariate(synthetic_batch):
         covariate_idx=0, delta=-0.1,
     )
     assert isinstance(diff, float)
+
+
+def test_simulate_rollout_is_deterministic(synthetic_batch):
+    """Regression test: simulate_rollout previously called the model directly,
+    which samples eps ~ N(0,1) unconditionally in reparameterize() even under
+    .eval() + no_grad(), making repeated calls with identical inputs diverge by
+    up to ~0.47 on a ~[0,1]-scaled feature. It must now be a deterministic
+    point-estimate rollout (decodes from the posterior mean)."""
+    b = synthetic_batch
+    model = _make_model(b)
+    nf_init = b["node_features"][0:1, 0:1]
+
+    r1 = simulate_rollout(model, nf_init, b["covariates"][0:1], b["adj"], steps=3)
+    r2 = simulate_rollout(model, nf_init, b["covariates"][0:1], b["adj"], steps=3)
+
+    assert torch.allclose(r1, r2), f"simulate_rollout is non-deterministic: max diff {(r1 - r2).abs().max().item()}"
+
+
+def test_apply_counterfactual_signal_exceeds_noise_floor(synthetic_batch):
+    """Regression test: apply_counterfactual previously diffed a 10-sample MC
+    mean (generate_confidence_bands) against one independently-stochastic sample,
+    so delta=0.0 (no real change) and delta=-0.1 (real change) produced diffs of
+    comparable magnitude (~0.016 vs ~0.015 in the reviewer's measurement) — the
+    "effect" was indistinguishable from sampling noise. Both sides must now go
+    through the same deterministic decode so delta=0.0 collapses to (near) zero
+    and a real delta produces a clean, larger signal."""
+    b = synthetic_batch
+    model = _make_model(b)
+
+    diff_zero = apply_counterfactual(
+        model, b["node_features"], b["times"], b["covariates"], b["adj"], b["mask"],
+        covariate_idx=0, delta=0.0,
+    )
+    diff_real = apply_counterfactual(
+        model, b["node_features"], b["times"], b["covariates"], b["adj"], b["mask"],
+        covariate_idx=0, delta=-0.1,
+    )
+
+    assert abs(diff_zero) < 1e-5, f"delta=0.0 should produce ~zero diff, got {diff_zero}"
+    assert diff_real != 0.0
+    assert abs(diff_real) > abs(diff_zero) + 1e-4, (
+        f"real counterfactual effect ({diff_real}) is not distinguishable from the "
+        f"delta=0.0 noise floor ({diff_zero})"
+    )
