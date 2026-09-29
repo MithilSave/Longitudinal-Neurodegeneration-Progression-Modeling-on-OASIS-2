@@ -6,6 +6,12 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
 
 # ===== Jupyter =====
 .ipynb_checkpoints/
@@ -14,12 +20,24 @@ build/
 # Raw MRI data is too large for GitHub (~24.7 GB)
 # Download from: https://www.oasis-brains.org/#data
 data/raw/OAS2_RAW_PART1/
+# Any imaging/derived volumes and checkpoints
+*.nii
+*.nii.gz
+*.mgz
+*.pt
+*.pth
+*.ckpt
 
 # ===== Outputs & Models (not pushed for now) =====
 outputs/
 /models/
 
+# ===== Claude Code local state / worktrees =====
+.claude/
+
 # ===== OS / IDE =====
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
 *.swp

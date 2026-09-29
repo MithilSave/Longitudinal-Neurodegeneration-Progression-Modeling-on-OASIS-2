@@ -73,14 +73,38 @@ A structural connectome template (`data/processed/template_connectome.npy`) is i
    ```
 3. Open `OASIS2_Local_Pipeline.ipynb` in Jupyter and run all cells
 
+## Running the Python Package
+
+The pipeline is also available as a tested Python package under `src/oasis2/`, converted from the Colab notebook. It's the canonical, importable implementation; the notebooks remain as Colab/local-runnable artifacts.
+
+```bash
+pip install -e .
+pip install -r requirements.txt
+pytest tests/  # synthetic-data tests, no MRI scans required
+python -m oasis2 --demo-csv data/raw/oasis_longitudinal_demographics.csv --regional-volumes-csv outputs/regional_volumes.csv
+```
+
+See [docs/superpowers/specs/2026-09-28-py-pipeline-conversion-design.md](docs/superpowers/specs/2026-09-28-py-pipeline-conversion-design.md) for the module layout.
+
 ## Repository Structure
 
 ```
 ├── .gitignore
 ├── README.md
+├── pyproject.toml                                 # Package + pytest config
+├── requirements.txt
 ├── implementation.md                              # Full mathematical and architectural documentation
-├── OASIS2_Complete_Colab_Pipeline_FIXED (1).ipynb  # Colab notebook (self-contained)
+├── model1_ST_GNN_ODE.md / model2_ND_VAE.md / model3_TADM.md  # Per-model docs
+├── model_implementation_plan.md
+├── OASIS2_Complete_Colab_Pipeline.ipynb           # Colab notebook (self-contained)
 ├── OASIS2_Local_Pipeline.ipynb                    # Local notebook
+├── OASIS2_Colab.py                                # Legacy flat-script export of the notebook
+├── src/oasis2/                                    # Importable pipeline package (python -m oasis2)
+│   ├── data/                                      # Ingest, SynthSeg wrapper, datasets
+│   ├── models/                                    # ST-GNN-ODE, ND-VAE, TADM, benchmark
+│   └── ...                                        # ndm, connectome, deficits, interpretability, digital_twin, pipeline, cli
+├── tests/                                         # Synthetic-data pytest suite
+├── docs/superpowers/                              # Design spec and implementation plan
 ├── data/
 │   ├── raw/
 │   │   ├── oasis_longitudinal_demographics-*.xlsx # Demographics spreadsheet (tracked)
