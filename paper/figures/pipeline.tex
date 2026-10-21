@@ -1,0 +1,36 @@
+\begin{tikzpicture}[
+  font=\footnotesize,
+  box/.style={draw, rounded corners=2pt, minimum height=10mm, minimum width=33mm, align=center, fill=blue!6},
+  mdl/.style={draw, rounded corners=2pt, minimum height=6mm, minimum width=33mm, align=center, fill=orange!14},
+  fin/.style={draw, rounded corners=2pt, minimum height=10mm, minimum width=33mm, align=center, fill=green!10},
+  arr/.style={-{Stealth[length=2mm]}, thick}
+]
+% Row 1
+\node[box] (mri) at (0,0) {T1-weighted MRI\\(373 sessions)};
+\node[box] (seg) at (4.2,0) {Segmentation\\(SynthSeg / FSL fallback)};
+\node[box] (vol) at (8.4,0) {56 regional volumes\\(normalised by eTIV)};
+\node[box] (w)   at (12.6,0) {Age-normalised\\W-scores $x_0$};
+\draw[arr] (mri) -- (seg);
+\draw[arr] (seg) -- (vol);
+\draw[arr] (vol) -- (w);
+
+% Row 2
+\node[box] (conn) at (0,-3.0) {Template connectome\\$L=D-A$ (56$\times$56)};
+\node[box] (ndm)  at (4.2,-3.0) {NDM baseline\\$x(t)=e^{-\beta Lt}x_0$};
+\node[mdl] (m1) at (8.4,-2.3) {ST-GNN-ODE};
+\node[mdl] (m2) at (8.4,-3.0) {ND-VAE};
+\node[mdl] (m3) at (8.4,-3.7) {TADM};
+\node[box] (map) at (12.6,-3.0) {Region$\to$domain\\deficit mapping (11 domains)};
+\draw[arr] (conn) -- (ndm);
+
+\node[draw, dashed, rounded corners=2pt, fit=(m1)(m2)(m3), inner sep=1.5mm] (fc) {};
+\draw[arr] (ndm) -- (fc.west);
+\draw[arr] (fc.east) -- (map);
+\draw[arr] (w.south) -- (map.north);
+\draw[arr] (w.south west) ++(5mm,0) -- ++(0,-1.0) -| (ndm.north);
+
+% Row 3
+\node[fin, minimum width=90mm] (sim) at (8.4,-5.6) {\textbf{3D digital-twin simulator}\\subject selection, time slider, region focus, deficit bars};
+\draw[arr] (map.south) -- (map.south |- sim.north);
+\draw[arr] (ndm.south) -- (ndm.south |- sim.north);
+\end{tikzpicture}

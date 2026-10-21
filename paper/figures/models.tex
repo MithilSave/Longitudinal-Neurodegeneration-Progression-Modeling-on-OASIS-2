@@ -1,0 +1,32 @@
+\begin{tikzpicture}[
+  font=\footnotesize,
+  n/.style={draw, rounded corners=2pt, minimum height=9mm, align=center, inner sep=2pt},
+  enc/.style={n, fill=blue!8},
+  core/.style={n, fill=orange!16},
+  dec/.style={n, fill=green!10},
+  loss/.style={n, fill=red!8, dashed},
+  arr/.style={-{Stealth[length=1.8mm]}, thick},
+  lab/.style={font=\bfseries\footnotesize, anchor=east}
+]
+% Row 1: ST-GNN-ODE
+\node[lab] at (0,0) {(a) ST-GNN-ODE};
+\node[enc] (a1) at (1.2,0) {Encoder\\$h(t_0)$};
+\node[core, right=7mm of a1, minimum width=50mm] (a2) {ODE: $\dot h=\mathrm{GAT}(h,A)+\mathrm{MLP}(h\,\|\,c\,\|\,\sin\omega t)$\\5 Euler steps to each $t_k$};
+\node[dec, right=9mm of a2, minimum width=30mm] (a3) {Decoders\\$\hat X$, MMSE, CDR};
+\draw[arr] (a1) -- (a2); \draw[arr] (a2) -- (a3);
+
+% Row 2: ND-VAE
+\node[lab] at (0,-1.7) {(b) ND-VAE};
+\node[enc] (b1) at (1.2,-1.7) {GRU encoder\\$X_{0:K-1},c$};
+\node[enc, right=7mm of b1] (b2) {$z\sim\mathcal{N}(\mu,\sigma^2)$\\$z\in\mathbb{R}^{16}$};
+\node[dec, right=7mm of b2, minimum width=28mm] (b3) {Decoder $g_\psi(z,t,c)$\\$\hat X(t)$};
+\node[loss, right=7mm of b3, minimum width=40mm] (b4) {$\mathcal{L}=\ell_1+\beta_{\mathrm{KL}}\mathrm{KL}+\lambda\,\|\dot{\hat X}+\beta L\hat X\|^2$};
+\draw[arr] (b1) -- (b2); \draw[arr] (b2) -- (b3); \draw[arr] (b3) -- (b4);
+
+% Row 3: TADM
+\node[lab] at (0,-3.4) {(c) TADM};
+\node[enc] (c1) at (1.2,-3.4) {Condition $e_{\mathrm{cond}}$\\GCN$(X_0)$+time+$c$};
+\node[core, right=7mm of c1, minimum width=34mm] (c2) {FiLM MLP denoiser\\$\epsilon_\theta(X^{(\tau)},\tau,e_{\mathrm{cond}})$};
+\node[dec, right=7mm of c2, minimum width=34mm] (c3) {DDIM, 10 steps\\$\hat X(t^*)$, repeat for spread};
+\draw[arr] (c1) -- (c2); \draw[arr] (c2) -- (c3);
+\end{tikzpicture}
